@@ -29,6 +29,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+
 #define GWK_SERVER_PFD_SHIFT	1
 #define DEFAULT_GWROK_ADDR	"127.0.0.1"
 #define DEFAULT_GWROK_PORT	9777
@@ -50,8 +51,8 @@ struct gwk_packet {
 		uint8_t	__data[4096];
 	};
 } __attribute__((__packed__));
-
 #define PKT_HDR_SIZE (sizeof(struct gwk_packet) - sizeof(uint8_t[4096]))
+
 
 /*
  * ========== Start structure definitions for server. ==========
@@ -72,10 +73,12 @@ struct gwk_server_cfg {
 
 struct gwk_client_entry {
 	int			fd;
+	int			ep_fd;
 	uint32_t		idx;
 	struct sockaddr_in	addr;
 	size_t			pkt_len;
 	struct gwk_packet	pkt;
+	pthread_t		ep_thread;
 };
 
 struct gwk_server_tracker {
@@ -95,7 +98,7 @@ struct gwk_server_ctx {
 	struct gwk_server_cfg		cfg;
 };
 
-
+struct gwk_packet	pkt;
 /*
  * ========== Structure definitions for client. ==========
  */
@@ -439,6 +442,7 @@ static int gwk_server_init_clients(struct gwk_server_ctx *ctx)
 		struct gwk_client_entry *entry = &ctx->clients[i];
 
 		entry->fd = -1;
+		entry->ep_fd = -1;
 		entry->idx = i;
 	}
 	return 0;
@@ -765,7 +769,11 @@ static int gwk_server_close_client(struct gwk_server_ctx *ctx,
 	pfd->revents = 0;
 
 	close(entry->fd);
+	if (entry->ep_fd != -1)
+		close(entry->ep_fd);
+
 	entry->fd = -1;
+	entry->ep_fd = -1;
 
 	printf("Closed a connection from %s:%hu\n",
 	       inet_ntoa(entry->addr.sin_addr), ntohs(entry->addr.sin_port));
