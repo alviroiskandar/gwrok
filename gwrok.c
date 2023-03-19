@@ -41,6 +41,7 @@ enum {
 	GWK_PKT_HANDSHAKE = 1,
 	GWK_PKT_RESERVE_EPHEMERAL_PORT = 2,
 	GWK_PKT_EPHEMERAL_PORT_DATA = 3,
+	GWK_PKT_CLIENT_IS_READY = 4,
 };
 
 struct gwk_pkt_ephemeral_port_data {
@@ -106,6 +107,7 @@ struct gwk_server_ctx {
 	nfds_t				poll_nfds;
 	struct gwk_server_tracker 	tracker;
 	struct gwk_server_cfg		cfg;
+	struct in_addr			shared_addr;
 };
 
 
@@ -127,6 +129,8 @@ struct gwk_client_ctx {
 	int				server_fd;
 	struct gwk_packet 		pkt;
 	struct gwk_client_cfg		cfg;
+	struct in_addr			s_bind_addr;
+	uint16_t			s_bind_port;
 };
 
 
@@ -457,6 +461,31 @@ static size_t gwk_pkt_prep_ephemeral_port_data(struct gwk_packet *pkt,
 	epp->port = addr->sin_port;
 	epp->__pad = 0;
 	return PKT_HDR_SIZE + sizeof(*epp);
+}
+
+static size_t gwk_pkt_prep_client_is_ready(struct gwk_packet *pkt)
+{
+	pkt->type = GWK_PKT_CLIENT_IS_READY;
+	pkt->__pad = 0;
+	pkt->len = 0;
+	return PKT_HDR_SIZE;
+}
+
+static int gwk_server_validate_configs(struct gwk_server_ctx *ctx)
+{
+	struct gwk_server_cfg *cfg = &ctx->cfg;
+
+	if (cfg->max_clients == 0) {
+		fprintf(stderr, "max_clients must be greater than 0\n");
+		return -EINVAL;
+	}
+
+	if (inet_pton(AF_INET, cfg->shared_addr, &ctx->shared_addr) != 1) {
+		fprintf(stderr, "Invalid shared_addr: %s\n", cfg->shared_addr);
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 static int gwk_server_init_clients(struct gwk_server_ctx *ctx)
@@ -814,11 +843,7 @@ static int gwk_server_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = 0;
-	if (inet_pton(AF_INET, ctx->cfg.shared_addr, &addr.sin_addr) != 1) {
-		fprintf(stderr, "Invalid shared address: %s\n",
-			ctx->cfg.shared_addr);
-		return -EINVAL;
-	}
+	addr.sin_addr = ctx->shared_addr;
 
 	fd = create_ephemeral_socket(&addr);
 	if (fd < 0)
@@ -1051,6 +1076,9 @@ static int gwk_server(struct gwk_server_ctx *ctx)
 {
 	int ret;
 
+	ret = gwk_server_validate_configs(ctx);
+	if (ret)
+		return ret;
 	ret = gwk_server_init_clients(ctx);
 	if (ret)
 		return ret;
@@ -1204,12 +1232,15 @@ static int gwk_client_perform_handshake(struct gwk_client_ctx *ctx)
 	return 0;
 }
 
-static void print_ephemeral_port_data_pkt(struct gwk_packet *pkt)
+static void print_ephemeral_port_data_pkt(struct gwk_client_ctx *ctx,
+					  struct gwk_packet *pkt)
 {
 	struct gwk_pkt_ephemeral_port_data *epp = &pkt->ep_data;
 
+	ctx->s_bind_addr.s_addr = epp->addr;
+	ctx->s_bind_port = epp->port;
 	printf("Successfully reserved ephemeral port %s:%hu\n",
-	       inet_ntoa(*(struct in_addr *)&epp->addr), ntohs(epp->port));
+	       inet_ntoa(ctx->s_bind_addr), ntohs(ctx->s_bind_port));
 }
 
 static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
@@ -1241,8 +1272,66 @@ static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 		return -EBADMSG;
 	}
 
-	print_ephemeral_port_data_pkt(pkt);
+	print_ephemeral_port_data_pkt(ctx, pkt);
 	return 0;
+}
+
+static int gwk_client_send_ready_signal(struct gwk_client_ctx *ctx)
+{
+	struct gwk_packet *pkt = &ctx->pkt;
+	ssize_t ret;
+	size_t len;
+
+	printf("Sending ready signal to the server...");
+	fflush(stdout);
+	len = gwk_pkt_prep_client_is_ready(pkt);
+	ret = gwk_send(ctx->server_fd, pkt, len);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to send ready packet: %s\n",
+			strerror(-ret));
+		return ret;
+	}
+	printf("sent!\n");
+
+	return 0;
+}
+
+static void gwk_client_print_ready(struct gwk_client_ctx *ctx)
+{
+	printf("%s:%hu is ready to accept connections via %s:%hu\n",
+	       ctx->cfg.target_addr, ctx->cfg.target_port,
+	       inet_ntoa(ctx->s_bind_addr), ntohs(ctx->s_bind_port));
+}
+
+static int gwk_client_poll(struct gwk_client_ctx *ctx)
+{
+	struct pollfd fds[1];
+	int ret;
+
+	fds[0].fd = ctx->server_fd;
+	fds[0].events = POLLIN;
+
+	ret = poll(fds, 1, -1);
+	if (ret < 0) {
+		ret = -errno;
+		perror("poll");
+		return ret;
+	}
+
+	return 0;
+}
+
+static int gwk_client_run(struct gwk_client_ctx *ctx)
+{
+	int ret = 0;
+
+	while (!ctx->stop) {
+		ret = gwk_client_poll(ctx);
+		if (ret)
+			break;
+	}
+
+	return ret;
 }
 
 static void gwk_client_destroy(struct gwk_client_ctx *ctx)
@@ -1272,7 +1361,12 @@ static int gwk_client(struct gwk_client_ctx *ctx)
 	ret = gwk_client_reserve_ephemeral_port(ctx);
 	if (ret)
 		goto out;
+	ret = gwk_client_send_ready_signal(ctx);
+	if (ret)
+		goto out;
 
+	gwk_client_print_ready(ctx);
+	ret = gwk_client_run(ctx);
 out:
 	gwk_client_destroy(ctx);
 	if (ret < 0)
