@@ -43,15 +43,24 @@ enum {
 	GWK_PKT_EPHEMERAL_PORT_DATA = 3,
 };
 
+struct gwk_pkt_ephemeral_port_data {
+	uint32_t	addr;
+	uint16_t	port;
+	uint16_t	__pad;
+} __attribute__((__packed__));
+
 struct gwk_packet {
 	uint8_t		type;
 	uint8_t		__pad;
 	uint16_t	len;
 	union {
-		uint8_t	__data[4096];
+		struct gwk_pkt_ephemeral_port_data	ep_data;
+		uint8_t					__data[4096];
 	};
 } __attribute__((__packed__));
+
 #define PKT_HDR_SIZE (sizeof(struct gwk_packet) - sizeof(uint8_t[4096]))
+#define PKT_EP_PORT_DATA_SIZE (PKT_HDR_SIZE + sizeof(struct gwk_pkt_ephemeral_port_data))
 
 
 /*
@@ -403,6 +412,21 @@ static bool validate_reserve_ephemeral_port_pkt(struct gwk_packet *pkt,
 	return true;
 }
 
+static bool validate_ephemeral_port_data_pkt(struct gwk_packet *pkt,
+					     size_t len)
+{
+	if (len != PKT_HDR_SIZE + sizeof(pkt->ep_data))
+		return false;
+
+	if (pkt->type != GWK_PKT_EPHEMERAL_PORT_DATA)
+		return false;
+
+	if (ntohs(pkt->len) != sizeof(pkt->ep_data))
+		return false;
+
+	return true;
+}
+
 static size_t gwk_pkt_prep_handshake(struct gwk_packet *pkt)
 {
 	pkt->type = GWK_PKT_HANDSHAKE;
@@ -419,6 +443,21 @@ static size_t gwk_pkt_prep_reserve_ephemeral_port(struct gwk_packet *pkt)
 	pkt->len = htons(10);
 	memcpy(pkt->__data, "GWROK_REP", 10);
 	return PKT_HDR_SIZE + 10;
+}
+
+static size_t gwk_pkt_prep_ephemeral_port_data(struct gwk_packet *pkt,
+					       struct sockaddr_in *addr)
+{
+	struct gwk_pkt_ephemeral_port_data *epp;
+
+	pkt->type = GWK_PKT_EPHEMERAL_PORT_DATA;
+	pkt->__pad = 0;
+	pkt->len = htons((uint16_t)sizeof(pkt->ep_data));
+	epp = &pkt->ep_data;
+	epp->addr = addr->sin_addr.s_addr;
+	epp->port = addr->sin_port;
+	epp->__pad = 0;
+	return PKT_HDR_SIZE + sizeof(*epp);
 }
 
 static int gwk_server_init_clients(struct gwk_server_ctx *ctx)
@@ -749,6 +788,24 @@ out_close:
 	return ret;
 }
 
+static int gwk_server_send_ephemeral_port_data(struct gwk_client_entry *entry)
+{
+	struct gwk_packet *pkt = &entry->pkt;
+	ssize_t ret;
+	size_t len;
+
+	len = gwk_pkt_prep_ephemeral_port_data(pkt, &entry->ep_addr);
+	ret = gwk_send(entry->fd, pkt, len);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to send ephemeral port data to %s:%hu\n",
+			inet_ntoa(entry->addr.sin_addr),
+			ntohs(entry->addr.sin_port));
+		return ret;
+	}
+
+	return 0;
+}
+
 static int gwk_server_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
 					     struct gwk_client_entry *entry)
 {
@@ -771,9 +828,10 @@ static int gwk_server_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
 	printf("Ephemeral port %s:%hu reserved for %s:%hu\n",
 	       inet_ntoa(addr.sin_addr), ntohs(addr.sin_port),
 	       inet_ntoa(entry->addr.sin_addr), ntohs(entry->addr.sin_port));
+
 	entry->ep_fd = fd;
 	entry->ep_addr = addr;
-	return 0;
+	return gwk_server_send_ephemeral_port_data(entry);
 }
 
 static int gwk_server_handle_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
@@ -797,7 +855,6 @@ static int gwk_server_handle_client_pkt(struct gwk_server_ctx *ctx,
 {
 	struct gwk_packet *pkt = &entry->pkt;
 
-	(void)ctx;
 	switch (pkt->type) {
 	case GWK_PKT_HANDSHAKE:
 		return gwk_server_handle_handshake(entry);
@@ -1148,13 +1205,22 @@ static int gwk_client_perform_handshake(struct gwk_client_ctx *ctx)
 	return 0;
 }
 
+static void print_ephemeral_port_data_pkt(struct gwk_packet *pkt)
+{
+	struct gwk_pkt_ephemeral_port_data *epp = &pkt->ep_data;
+
+	printf("Successfully reserved ephemeral port %s:%hu\n",
+	       inet_ntoa(*(struct in_addr *)&epp->addr), ntohs(epp->port));
+}
+
 static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 {
+	struct gwk_packet *pkt = &ctx->pkt;
 	ssize_t ret;
 	size_t len;
 
-	len = gwk_pkt_prep_reserve_ephemeral_port(&ctx->pkt);
-	ret = gwk_send(ctx->server_fd, &ctx->pkt, len);
+	len = gwk_pkt_prep_reserve_ephemeral_port(pkt);
+	ret = gwk_send(ctx->server_fd, pkt, len);
 	if (ret < 0) {
 		fprintf(stderr,
 			"Failed to send reserve ephemeral port packet: %s\n",
@@ -1162,6 +1228,21 @@ static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 		return ret;
 	}
 
+	memset(pkt, 0, len);
+	ret = gwk_recv(ctx->server_fd, pkt, PKT_EP_PORT_DATA_SIZE);
+	if (ret < 0) {
+		fprintf(stderr,
+			"Failed to receive reserve ephemeral port data: %s\n",
+			strerror(-ret));
+		return ret;
+	}
+
+	if (!validate_ephemeral_port_data_pkt(pkt, (size_t)ret)) {
+		fprintf(stderr, "Invalid ephemeral port data packet received!\n");
+		return -EBADMSG;
+	}
+
+	print_ephemeral_port_data_pkt(pkt);
 	return 0;
 }
 
