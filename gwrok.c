@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * gwrok - A simple gateway for TCP traffic for GNU/Weeb.
+ * gwrok - A simple TCP port forwarder for GNU/Weeb.
  *
  * Author: Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
  * License: GPLv2
@@ -37,12 +37,12 @@
  * ========== Structure definitions for client and server. ==========
  */
 enum {
-	CL_PKT_HANDSHAKE = 0,
-	CL_PKT_RESERVE_EPHEMERAL_PORT = 1,
-	CL_PKT_START_SLAVE_CONNECTION = 2,
+	GWK_PKT_HANDSHAKE = 1,
+	GWK_PKT_RESERVE_EPHEMERAL_PORT = 2,
+	GWK_PKT_EPHEMERAL_PORT_DATA = 3,
 };
 
-struct gwk_client_packet {
+struct gwk_packet {
 	uint8_t		type;
 	uint8_t		__pad;
 	uint16_t	len;
@@ -51,6 +51,7 @@ struct gwk_client_packet {
 	};
 } __attribute__((__packed__));
 
+#define PKT_HDR_SIZE (sizeof(struct gwk_packet) - sizeof(uint8_t[4096]))
 
 /*
  * ========== Start structure definitions for server. ==========
@@ -73,6 +74,8 @@ struct gwk_client_entry {
 	int			fd;
 	uint32_t		idx;
 	struct sockaddr_in	addr;
+	size_t			pkt_len;
+	struct gwk_packet	pkt;
 };
 
 struct gwk_server_tracker {
@@ -109,7 +112,7 @@ struct gwk_client_ctx {
 	int				sig;
 	int				target_fd;
 	int				server_fd;
-	struct gwk_client_packet 	pkt;
+	struct gwk_packet 		pkt;
 	struct gwk_client_cfg		cfg;
 };
 
@@ -127,8 +130,6 @@ static const struct option gwk_server_long_opts[] = {
 static const struct option gwk_client_long_opts[] = {
 	{ "help",		no_argument,		NULL,	'H' },
 	{ "target-addr",	required_argument,	NULL,	'h' },
-	{ "target-port",	required_argument,	NULL,	'p' },
-	{ "server-addr",	required_argument,	NULL,	'c' },
 	{ "server-port",	required_argument,	NULL,	'P' },
 	{ NULL,			0,			NULL,	0 },
 };
@@ -296,6 +297,123 @@ static int gwk_client_parse_args(int argc, char *argv[],
 	}
 
 	return 0;
+}
+
+static void poll_fd(int fd, short events)
+{
+	struct pollfd pfd;
+
+	pfd.fd = fd;
+	pfd.events = events;
+	poll(&pfd, 1, -1);
+}
+
+static void poll_for_write(int fd)
+{
+	poll_fd(fd, POLLOUT);
+}
+
+static void poll_for_read(int fd)
+{
+	poll_fd(fd, POLLIN);
+}
+
+static ssize_t gwk_send(int fd, const void *buf, size_t len)
+{
+	ssize_t ret;
+
+repeat:
+	ret = send(fd, buf, len, MSG_WAITALL);
+	if (ret < 0) {
+		int tmp = -errno;
+		if (tmp == -EINTR) {
+			goto repeat;
+		} else if (tmp == -EAGAIN) {
+			poll_for_write(fd);
+			goto repeat;
+		}
+
+		perror("send");
+		return tmp;
+	}
+
+	return ret;
+}
+
+static ssize_t gwk_recv(int fd, void *buf, size_t len)
+{
+	ssize_t ret;
+
+repeat:
+	ret = recv(fd, buf, len, MSG_WAITALL);
+	if (ret < 0) {
+		int tmp = -errno;
+		if (tmp == -EINTR) {
+			goto repeat;
+		} else if (tmp == -EAGAIN) {
+			poll_for_read(fd);
+			goto repeat;
+		}
+
+		perror("recv");
+		return tmp;
+	}
+
+	return ret;
+}
+
+
+static bool validate_handshake_pkt(struct gwk_packet *pkt, size_t len)
+{
+	if (len != PKT_HDR_SIZE + 6)
+		return false;
+
+	if (pkt->type != GWK_PKT_HANDSHAKE)
+		return false;
+
+	if (ntohs(pkt->len) != 6)
+		return false;
+
+	if (memcmp(pkt->__data, "GWROK", 6))
+		return false;
+
+	return true;
+}
+
+static bool validate_reserve_ephemeral_port_pkt(struct gwk_packet *pkt,
+						size_t len)
+{
+	if (len != PKT_HDR_SIZE + 10)
+		return false;
+
+	if (pkt->type != GWK_PKT_RESERVE_EPHEMERAL_PORT)
+		return false;
+
+	if (ntohs(pkt->len) != 10)
+		return false;
+
+	if (memcmp(pkt->__data, "GWROK_REP", 10))
+		return false;
+
+	return true;
+}
+
+size_t gwk_pkt_prep_handshake(struct gwk_packet *pkt)
+{
+	pkt->type = GWK_PKT_HANDSHAKE;
+	pkt->__pad = 0;
+	pkt->len = htons(6);
+	memcpy(pkt->__data, "GWROK", 6);
+	return PKT_HDR_SIZE + 6;
+}
+
+size_t gwk_pkt_prep_reserve_ephemeral_port(struct gwk_packet *pkt)
+{
+	pkt->type = GWK_PKT_RESERVE_EPHEMERAL_PORT;
+	pkt->__pad = 0;
+	pkt->len = htons(10);
+	memcpy(pkt->__data, "GWROK_REP", 10);
+	return PKT_HDR_SIZE + 10;
 }
 
 static int gwk_server_init_clients(struct gwk_server_ctx *ctx)
@@ -548,15 +666,81 @@ static int gwk_server_accept(struct gwk_server_ctx *ctx, struct pollfd *pfd)
 	return 0;
 }
 
+static int gwk_server_respond_handshake(struct gwk_client_entry *entry)
+{
+	ssize_t ret;
+	size_t len;
+
+	len = gwk_pkt_prep_handshake(&entry->pkt);
+	ret = gwk_send(entry->fd, &entry->pkt, len);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to send handshake response to %s:%hu\n",
+			inet_ntoa(entry->addr.sin_addr),
+			ntohs(entry->addr.sin_port));
+		return ret;
+	}
+
+	return 0;
+}
+
+static int gwk_server_handle_handshake(struct gwk_client_entry *entry)
+{
+	struct gwk_packet *pkt = &entry->pkt;
+	size_t len = entry->pkt_len;
+
+	if (!validate_handshake_pkt(pkt, len)) {
+		fprintf(stderr, "Invalid handshake packet from %s:%hu\n",
+			inet_ntoa(entry->addr.sin_addr),
+			ntohs(entry->addr.sin_port));
+		return -EBADMSG;
+	}
+
+	printf("Handshake from %s:%hu\n", inet_ntoa(entry->addr.sin_addr),
+	       ntohs(entry->addr.sin_port));
+
+	gwk_server_respond_handshake(entry);
+	return 0;
+}
+
+static int gwk_server_handle_reserve_ephemeral_port(struct gwk_client_entry *entry)
+{
+	struct gwk_packet *pkt = &entry->pkt;
+	size_t len = entry->pkt_len;
+
+	if (!validate_reserve_ephemeral_port_pkt(pkt, len)) {
+		fprintf(stderr, "Invalid reserve_ephemeral_port packet from %s:%hu\n",
+			inet_ntoa(entry->addr.sin_addr),
+			ntohs(entry->addr.sin_port));
+		return -EBADMSG;
+	}
+
+	return 0;
+}
+
+static int gwk_server_handle_client_pkt(struct gwk_server_ctx *ctx,
+					struct gwk_client_entry *entry)
+{
+	struct gwk_packet *pkt = &entry->pkt;
+
+	(void)ctx;
+	switch (pkt->type) {
+	case GWK_PKT_HANDSHAKE:
+		return gwk_server_handle_handshake(entry);
+	case GWK_PKT_RESERVE_EPHEMERAL_PORT:
+		return gwk_server_handle_reserve_ephemeral_port(entry);
+	default:
+		break;
+	}
+
+	return -EBADMSG;
+}
+
 static int gwk_server_handle_client_read(struct gwk_server_ctx *ctx,
 					 struct gwk_client_entry *entry)
 {
-	char buf[1024] = {0};
-	int ret = -1;
-	(void)ctx;
-	(void)entry;
+	ssize_t ret;
 
-	ret = recv(entry->fd, buf, sizeof(buf), 0);
+	ret = recv(entry->fd, &entry->pkt, sizeof(entry->pkt), 0);
 	if (ret < 0) {
 		ret = -errno;
 		perror("read");
@@ -566,7 +750,8 @@ static int gwk_server_handle_client_read(struct gwk_server_ctx *ctx,
 	if (ret == 0)
 		return -ENETDOWN;
 
-	return ret;
+	entry->pkt_len = (size_t)ret;
+	return gwk_server_handle_client_pkt(ctx, entry);
 }
 
 static int gwk_server_close_client(struct gwk_server_ctx *ctx,
@@ -855,18 +1040,55 @@ static int gwk_client_connect_to_server(struct gwk_client_ctx *ctx)
 
 static int gwk_client_perform_handshake(struct gwk_client_ctx *ctx)
 {
+	ssize_t ret;
+	size_t len;
+
+	printf("Performing gwrok hello handshake with server...\n");
+	len = gwk_pkt_prep_handshake(&ctx->pkt);
+	ret = gwk_send(ctx->server_fd, &ctx->pkt, len);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to send handshake packet: %s\n",
+			strerror(-ret));
+		return ret;
+	}
+
+	memset(&ctx->pkt, 0, len);
+	ret = gwk_recv(ctx->server_fd, &ctx->pkt, len);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to receive handshake packet: %s\n",
+			strerror(-ret));
+		return ret;
+	}
+
+	if (!validate_handshake_pkt(&ctx->pkt, (size_t)ret)) {
+		fprintf(stderr, "Invalid handshake packet received!\n");
+		return -EBADMSG;
+	}
+
+	printf("Handshake with server completed successfully!\n");
 	return 0;
 }
 
 static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 {
+	ssize_t ret;
+	size_t len;
+
+	len = gwk_pkt_prep_reserve_ephemeral_port(&ctx->pkt);
+	ret = gwk_send(ctx->server_fd, &ctx->pkt, len);
+	if (ret < 0) {
+		fprintf(stderr,
+			"Failed to send reserve ephemeral port packet: %s\n",
+			strerror(-ret));
+		return ret;
+	}
+
 	return 0;
 }
 
 static void gwk_client_destroy(struct gwk_client_ctx *ctx)
 {
 	if (ctx->server_fd >= 0) {
-		printf("Closing server socket...\n");
 		close(ctx->server_fd);
 		ctx->server_fd = -1;
 	}
