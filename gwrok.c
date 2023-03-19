@@ -34,7 +34,26 @@
 #define DEFAULT_GWROK_PORT	9777
 
 /*
- * ========== Start struct definitions for server. ==========
+ * ========== Structure definitions for client and server. ==========
+ */
+enum {
+	CL_PKT_HANDSHAKE = 0,
+	CL_PKT_RESERVE_EPHEMERAL_PORT = 1,
+	CL_PKT_START_SLAVE_CONNECTION = 2,
+};
+
+struct gwk_client_packet {
+	uint8_t		type;
+	uint8_t		__pad;
+	uint16_t	len;
+	union {
+		uint8_t	__data[4096];
+	};
+} __attribute__((__packed__));
+
+
+/*
+ * ========== Start structure definitions for server. ==========
  */
 struct stack32 {
 	uint32_t	rsp;
@@ -72,13 +91,10 @@ struct gwk_server_ctx {
 	struct gwk_server_tracker 	tracker;
 	struct gwk_server_cfg		cfg;
 };
-/*
- * ========== End struct definitions for server. ==========
- */
 
 
 /*
- * ========== Start struct definitions for client. ==========
+ * ========== Structure definitions for client. ==========
  */
 struct gwk_client_cfg {
 	const char	*app;
@@ -89,34 +105,14 @@ struct gwk_client_cfg {
 };
 
 struct gwk_client_ctx {
-	volatile bool		stop;
-	int			sig;
-	int			target_fd;
-	int			server_fd;
-	struct gwk_client_cfg	cfg;
-};
-/*
- * ========== End struct definitions for server. ==========
- */
-
-
-/*
- * ========== Start struct definitions for client and server. ==========
- */
-enum {
-	CL_PKT_HANDSHAKE = 0,
-	CL_PKT_RESERVE_EPHEMERAL_PORT = 1,
-	CL_PKT_START_SLAVE_CONNECTION = 2,
+	volatile bool			stop;
+	int				sig;
+	int				target_fd;
+	int				server_fd;
+	struct gwk_client_packet 	pkt;
+	struct gwk_client_cfg		cfg;
 };
 
-struct gwk_client_packet {
-	uint8_t		type;
-	uint8_t		__pad;
-	uint16_t	len;
-} __attribute__((__packed__));
-/*
- * ========== End struct definitions for client and server. ==========
- */
 
 static const struct option gwk_server_long_opts[] = {
 	{ "help",		no_argument,		NULL,	'H' },
@@ -857,9 +853,14 @@ static int gwk_client_connect_to_server(struct gwk_client_ctx *ctx)
 	return 0;
 }
 
+static int gwk_client_perform_handshake(struct gwk_client_ctx *ctx)
+{
+	return 0;
+}
+
 static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 {
-	int ret;
+	return 0;
 }
 
 static void gwk_client_destroy(struct gwk_client_ctx *ctx)
@@ -882,6 +883,9 @@ static int gwk_client(struct gwk_client_ctx *ctx)
 	if (ret)
 		return ret;
 	ret = gwk_client_connect_to_server(ctx);
+	if (ret)
+		goto out;
+	ret = gwk_client_perform_handshake(ctx);
 	if (ret)
 		goto out;
 	ret = gwk_client_reserve_ephemeral_port(ctx);
