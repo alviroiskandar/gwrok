@@ -1,6 +1,7 @@
 
 CC ?= cc
 CLFAGS ?= -Wall -Wextra -g -I/usr/include -I/usr/local/include -L/usr/lib -L/usr/local/lib -O2
+# # -fsanitize=address -fsanitize=undefined
 
 all: gwrok
 
