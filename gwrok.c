@@ -99,7 +99,7 @@ struct gwk_server_ctx {
 	struct gwk_server_cfg		cfg;
 };
 
-struct gwk_packet	pkt;
+
 /*
  * ========== Structure definitions for client. ==========
  */
