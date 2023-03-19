@@ -403,7 +403,7 @@ static bool validate_reserve_ephemeral_port_pkt(struct gwk_packet *pkt,
 	return true;
 }
 
-size_t gwk_pkt_prep_handshake(struct gwk_packet *pkt)
+static size_t gwk_pkt_prep_handshake(struct gwk_packet *pkt)
 {
 	pkt->type = GWK_PKT_HANDSHAKE;
 	pkt->__pad = 0;
@@ -412,7 +412,7 @@ size_t gwk_pkt_prep_handshake(struct gwk_packet *pkt)
 	return PKT_HDR_SIZE + 6;
 }
 
-size_t gwk_pkt_prep_reserve_ephemeral_port(struct gwk_packet *pkt)
+static size_t gwk_pkt_prep_reserve_ephemeral_port(struct gwk_packet *pkt)
 {
 	pkt->type = GWK_PKT_RESERVE_EPHEMERAL_PORT;
 	pkt->__pad = 0;
