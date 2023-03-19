@@ -76,6 +76,7 @@ struct gwk_client_entry {
 	int			ep_fd;
 	uint32_t		idx;
 	struct sockaddr_in	addr;
+	struct sockaddr_in	ep_addr;
 	size_t			pkt_len;
 	struct gwk_packet	pkt;
 	pthread_t		ep_thread;
@@ -198,6 +199,17 @@ static void gwk_server_set_default_values(struct gwk_server_ctx *ctx)
 	ctx->cfg.bind_port = DEFAULT_GWROK_PORT;
 	ctx->cfg.backlog = 1024;
 	ctx->cfg.max_clients = 1024;
+	ctx->cfg.shared_addr = (char *)DEFAULT_GWROK_ADDR;
+}
+
+static void gwk_client_set_default_values(struct gwk_client_ctx *ctx)
+{
+	ctx->sig = -1;
+	ctx->server_fd = -1;
+	ctx->target_fd = -1;
+	ctx->cfg.server_addr = (char *)DEFAULT_GWROK_ADDR;
+	ctx->cfg.server_port = DEFAULT_GWROK_PORT;
+	ctx->cfg.target_port = DEFAULT_GWROK_PORT;
 }
 
 static int gwk_server_parse_args(int argc, char *argv[],
@@ -244,16 +256,6 @@ static int gwk_server_parse_args(int argc, char *argv[],
 	}
 
 	return 0;
-}
-
-static void gwk_client_set_default_values(struct gwk_client_ctx *ctx)
-{
-	ctx->sig = -1;
-	ctx->server_fd = -1;
-	ctx->target_fd = -1;
-	ctx->cfg.server_addr = (char *)DEFAULT_GWROK_ADDR;
-	ctx->cfg.server_port = DEFAULT_GWROK_PORT;
-	ctx->cfg.target_port = DEFAULT_GWROK_PORT;
 }
 
 static int gwk_client_parse_args(int argc, char *argv[],
@@ -706,7 +708,76 @@ static int gwk_server_handle_handshake(struct gwk_client_entry *entry)
 	return 0;
 }
 
-static int gwk_server_handle_reserve_ephemeral_port(struct gwk_client_entry *entry)
+static int create_ephemeral_socket(struct sockaddr_in *addr)
+{
+	socklen_t addrlen;
+	int fd, ret;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		return -errno;
+	}
+
+	addr->sin_port = 0;
+	ret = bind(fd, (struct sockaddr *)addr, sizeof(*addr));
+	if (ret < 0) {
+		ret = -errno;
+		perror("bind");
+		goto out_close;
+	}
+
+	ret = listen(fd, 32);
+	if (ret < 0) {
+		ret = -errno;
+		perror("listen");
+		goto out_close;
+	}
+
+	addrlen = sizeof(*addr);
+	ret = getsockname(fd, (struct sockaddr *)addr, &addrlen);
+	if (ret < 0) {
+		ret = -errno;
+		perror("getsockname");
+		goto out_close;
+	}
+
+	return fd;
+
+out_close:
+	close(fd);
+	return ret;
+}
+
+static int gwk_server_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
+					     struct gwk_client_entry *entry)
+{
+	struct sockaddr_in addr;
+	int fd;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = 0;
+	if (inet_pton(AF_INET, ctx->cfg.shared_addr, &addr.sin_addr) != 1) {
+		fprintf(stderr, "Invalid shared address: %s\n",
+			ctx->cfg.shared_addr);
+		return -EINVAL;
+	}
+
+	fd = create_ephemeral_socket(&addr);
+	if (fd < 0)
+		return fd;
+
+	printf("Ephemeral port %s:%hu reserved for %s:%hu\n",
+	       inet_ntoa(addr.sin_addr), ntohs(addr.sin_port),
+	       inet_ntoa(entry->addr.sin_addr), ntohs(entry->addr.sin_port));
+	entry->ep_fd = fd;
+	entry->ep_addr = addr;
+	return 0;
+}
+
+static int gwk_server_handle_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
+						    struct gwk_client_entry *entry)
 {
 	struct gwk_packet *pkt = &entry->pkt;
 	size_t len = entry->pkt_len;
@@ -718,7 +789,7 @@ static int gwk_server_handle_reserve_ephemeral_port(struct gwk_client_entry *ent
 		return -EBADMSG;
 	}
 
-	return 0;
+	return gwk_server_reserve_ephemeral_port(ctx, entry);
 }
 
 static int gwk_server_handle_client_pkt(struct gwk_server_ctx *ctx,
@@ -731,7 +802,7 @@ static int gwk_server_handle_client_pkt(struct gwk_server_ctx *ctx,
 	case GWK_PKT_HANDSHAKE:
 		return gwk_server_handle_handshake(entry);
 	case GWK_PKT_RESERVE_EPHEMERAL_PORT:
-		return gwk_server_handle_reserve_ephemeral_port(entry);
+		return gwk_server_handle_reserve_ephemeral_port(ctx, entry);
 	default:
 		break;
 	}
