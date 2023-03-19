@@ -376,7 +376,6 @@ repeat:
 	return ret;
 }
 
-
 static bool validate_handshake_pkt(struct gwk_packet *pkt, size_t len)
 {
 	if (len != PKT_HDR_SIZE + 6)
