@@ -105,6 +105,7 @@ struct gwk_slave_entry {
 	struct pollfd		*poll_fds;
 	int			*c_fds;
 	struct gwk_slave_conn	*entries;
+	struct free_slot	fs;
 };
 
 struct gwk_client_entry {
@@ -567,6 +568,56 @@ static int init_free_slot(struct free_slot *fs, uint32_t max)
 	return 0;
 }
 
+static int up_size_free_slot(struct free_slot *fs, uint32_t max)
+{
+	struct stack32 *stack;
+	uint32_t old_rbp;
+	uint32_t old_rsp;
+	uint32_t new_rsp;
+	uint32_t new_rbp;
+	uint32_t *data;
+	uint32_t i;
+	int ret;
+
+	pthread_mutex_lock(&fs->lock);
+	/*
+	 * @max has to be greater than the current max. Otherwise, we
+	 * will lose track of the free slots.
+	 */
+	if (max <= fs->stack->rbp) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	stack = realloc(fs->stack, sizeof(*stack) + sizeof(stack->data[0]) * max);
+	if (!stack) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/*
+	 * Expert only, don't try this at home!
+	 */
+	i = max;
+	data = stack->data;
+	old_rbp = stack->rbp;
+	old_rsp = stack->rsp;
+	new_rsp = old_rsp + (max - old_rbp);
+	new_rbp = max;
+	memmove(&data[new_rsp], &data[old_rsp], sizeof(data[0]) * (old_rbp - old_rsp));
+	stack->rbp = new_rbp;
+	stack->rsp = new_rsp;
+
+	/* Whee... */
+	while (i > old_rbp)
+		data[--stack->rsp] = --i;
+
+	fs->stack = stack;
+out:
+	pthread_mutex_unlock(&fs->lock);
+	return ret;
+}
+
 static void destroy_free_slot(struct free_slot *fs)
 {
 	pthread_mutex_destroy(&fs->lock);
@@ -587,13 +638,17 @@ static int init_slave_entries(struct gwk_slave_entry *se, uint32_t max)
 	entries = calloc(max, sizeof(*entries));
 	if (!c_fds || !p_fds || !entries) {
 		ret = -ENOMEM;
-		goto out_err;
+		goto out_free_callocs;
 	}
+
+	ret = init_free_slot(&se->fs, max);
+	if (ret)
+		goto out_free_callocs;
 
 	ret = pthread_mutex_init(&se->lock, NULL);
 	if (ret) {
 		ret = -ret;
-		goto out_err;
+		goto out_free_slot;
 	}
 
 	for (i = 0; i < max; i++) {
@@ -610,7 +665,9 @@ static int init_slave_entries(struct gwk_slave_entry *se, uint32_t max)
 	se->poll_nfds = 0;
 	return 0;
 
-out_err:
+out_free_slot:
+	destroy_free_slot(&se->fs);
+out_free_callocs:
 	free(c_fds);
 	free(p_fds);
 	free(entries);
@@ -620,13 +677,14 @@ out_err:
 static int up_size_slave_entries(struct gwk_slave_entry *se)
 {
 	struct gwk_slave_conn *entries;
+	size_t i, new_size, old_size;
 	struct pollfd *p_fds;
-	size_t i, new_size;
 	int *c_fds;
 	int ret;
 
 	pthread_mutex_lock(&se->lock);
-	new_size = se->allocated * 2u + 1u;
+	old_size = se->allocated;
+	new_size = old_size * 2u + 1u;
 
 	c_fds = realloc(se->c_fds, new_size * sizeof(*c_fds));
 	if (!c_fds) {
@@ -649,6 +707,23 @@ static int up_size_slave_entries(struct gwk_slave_entry *se)
 		goto out;
 	}
 
+	ret = up_size_free_slot(&se->fs, new_size);
+	if (ret) {
+		se->entries = entries;
+		se->poll_fds = p_fds;
+		se->c_fds = c_fds;
+		goto out;
+	}
+
+	for (i = old_size; i < new_size; i++) {
+		c_fds[i] = -1;
+		p_fds[i].fd = -1;
+		p_fds[i].events = 0;
+		p_fds[i].revents = 0;
+		entries[i].fd = -1;
+		memset(&entries[i].addr, 0, sizeof(entries[i].addr));
+	}
+
 	se->allocated = new_size;
 	se->c_fds = c_fds;
 	se->poll_fds = p_fds;
@@ -667,6 +742,7 @@ static void destroy_slave_entries(struct gwk_slave_entry *se)
 		free(se->c_fds);
 		free(se->poll_fds);
 		free(se->entries);
+		destroy_free_slot(&se->fs);
 		memset(se, 0, sizeof(*se));
 	}
 }
@@ -1192,11 +1268,12 @@ static int gwk_server_eph_poll(struct gwk_server_ctx *ctx,
 			       struct gwk_client_entry *client)
 {
 	struct gwk_slave_entry *slave = &client->slave;
-	struct pollfd *fds = READ_ONCE(slave->poll_fds);
-	nfds_t nfds, i;
+	struct pollfd *fds;
 	int nr_events;
+	nfds_t i;
 	int ret;
 
+	fds = READ_ONCE(slave->poll_fds);
 	ret = poll(fds, slave->poll_nfds, -1);
 	if (ret < 0) {
 		ret = -errno;
@@ -1211,7 +1288,6 @@ static int gwk_server_eph_poll(struct gwk_server_ctx *ctx,
 		return 0;
 
 	nr_events = ret;
-
 	ret = gwk_server_eph_accept(ctx, client, &fds[0]);
 	if (ret < 0) {
 		fprintf(stderr, "Failed to accept new connection: %s\n",
@@ -1221,8 +1297,12 @@ static int gwk_server_eph_poll(struct gwk_server_ctx *ctx,
 		nr_events--;
 	}
 
-	// for (i = 1; i < slave->poll_nfds; i++) {
-	// }
+	if (!nr_events)
+		return 0;
+
+	fds = READ_ONCE(slave->poll_fds);
+	for (i = 1; i < slave->poll_nfds; i++) {
+	}
 
 	return 0;
 }
