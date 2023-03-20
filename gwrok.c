@@ -112,9 +112,9 @@ struct gwk_server_ctx {
 	int				tcp_fd;
 	int				notifier_fd;
 	struct gwk_client_entry		*clients;
-	pthread_mutex_t			clients_lock;
 	struct pollfd			*poll_fds;
 	nfds_t				poll_nfds;
+	pthread_mutex_t			clients_lock;
 	struct gwk_server_tracker 	tracker;
 	struct gwk_server_cfg		cfg;
 	struct in_addr			shared_addr;
@@ -137,13 +137,12 @@ struct gwk_client_ctx {
 	int				sig;
 	int				target_fd;
 	int				server_fd;
-	struct pollfd			*poll_fds;
-	nfds_t				poll_nfds;
-	size_t				allocated_poll_fds;
 	struct gwk_packet 		pkt;
 	struct gwk_client_cfg		cfg;
 	struct in_addr			s_bind_addr;
 	uint16_t			s_bind_port;
+	struct sockaddr_in		target_addr;
+	struct sockaddr_in		server_addr;
 };
 
 
@@ -1024,6 +1023,9 @@ static int gwk_server_handle_client_pkt(struct gwk_server_ctx *ctx,
 		return gwk_server_handle_reserve_ephemeral_port(ctx, entry);
 	case GWK_PKT_CLIENT_IS_READY:
 		return gwk_server_handle_client_is_ready(entry);
+	case GWK_PKT_CONN_DATA:
+		printf("test aaaaaaaaaaaaaaaaaaaaaa\n");
+		break;
 	default:
 		break;
 	}
@@ -1285,6 +1287,7 @@ out:
 static int gwk_client_validate_configs(struct gwk_client_ctx *ctx)
 {
 	struct gwk_client_cfg *cfg = &ctx->cfg;
+	struct sockaddr_in *addr = &ctx->target_addr;
 
 	if (cfg->target_addr == NULL) {
 		fprintf(stderr, "Target address not specified!\n");
@@ -1294,6 +1297,25 @@ static int gwk_client_validate_configs(struct gwk_client_ctx *ctx)
 
 	if (cfg->target_port == 0) {
 		fprintf(stderr, "Target port not specified!\n");
+		show_client_usage(ctx->cfg.app);
+		return -EINVAL;
+	}
+
+	memset(addr, 0, sizeof(*addr));
+	addr->sin_family = AF_INET;
+	addr->sin_port = htons(cfg->target_port);
+	if (inet_pton(AF_INET, cfg->target_addr, &addr->sin_addr) != 1) {
+		fprintf(stderr, "Invalid target address: %s\n", cfg->target_addr);
+		show_client_usage(ctx->cfg.app);
+		return -EINVAL;
+	}
+
+	addr = &ctx->server_addr;
+	memset(addr, 0, sizeof(*addr));
+	addr->sin_family = AF_INET;
+	addr->sin_port = htons(cfg->server_port);
+	if (inet_pton(AF_INET, cfg->server_addr, &addr->sin_addr) != 1) {
+		fprintf(stderr, "Invalid server address: %s\n", cfg->server_addr);
 		show_client_usage(ctx->cfg.app);
 		return -EINVAL;
 	}
@@ -1333,20 +1355,6 @@ static int gwk_client_install_signal_handlers(struct gwk_client_ctx *ctx)
 out_err:
 	perror("sigaction");
 	return -errno;
-}
-
-static int gwk_client_init_poll_fds(struct gwk_client_ctx *ctx)
-{
-	struct pollfd *poll_fds;
-
-	ctx->allocated_poll_fds = 16;
-	poll_fds = calloc(ctx->allocated_poll_fds, sizeof(*poll_fds));
-	if (!poll_fds)
-		return -ENOMEM;
-
-	ctx->poll_fds = poll_fds;
-	ctx->poll_nfds = 0;
-	return 0;
 }
 
 static int gwk_client_connect_to_server(struct gwk_client_ctx *ctx)
@@ -1495,17 +1503,158 @@ static void gwk_client_print_ready(struct gwk_client_ctx *ctx)
 	       inet_ntoa(ctx->s_bind_addr), ntohs(ctx->s_bind_port));
 }
 
+struct gwk_client_conn_data {
+	struct gwk_client_ctx	*ctx;
+	int			server_fd;
+	uint32_t		s_addr;
+	uint16_t		s_port;
+};
+
+struct gwk_client_ep_fd {
+	int	circuit_fd;
+	int	target_fd;
+};
+
+static int gwk_client_create_target_fd(struct gwk_client_ep_fd *fdp,
+				       struct gwk_client_conn_data *data)
+{
+	struct gwk_client_ctx *ctx = data->ctx;
+	struct sockaddr_in addr = ctx->target_addr;
+	int ret;
+	int fd;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		ret = -errno;
+		perror("socket target_fd");
+		return ret;
+	}
+
+	ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		ret = -errno;
+		perror("connect target_fd");
+		close(fd);
+		return ret;
+	}
+
+	fdp->target_fd = fd;
+	return 0;
+}
+
+static int gwk_client_create_circuit_fd(struct gwk_client_ep_fd *fdp,
+					struct gwk_client_conn_data *data)
+{
+	struct gwk_client_ctx *ctx = data->ctx;
+	struct sockaddr_in addr = ctx->server_addr;
+	struct gwk_packet pkt;
+	size_t len;
+	int ret;
+	int fd;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		ret = -errno;
+		perror("socket target_fd");
+		return ret;
+	}
+
+	printf("connecting to circuit\n");
+	ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		ret = -errno;
+		perror("connect circuit_fd");
+		close(fd);
+		return ret;
+	}
+
+	len = gwk_pkt_prep_conn_data(&pkt, data->s_addr, data->s_port);
+	ret = gwk_send(fd, &pkt, len);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to send circuit request packet: %s\n",
+			strerror(-ret));
+		close(fd);
+		return ret;
+	}
+
+	printf("sent to circuit: %zd\n", (ssize_t)ret);
+	fdp->circuit_fd = fd;
+	return 0;
+}
+
+static int gwk_client_create_circuit_pair(struct gwk_client_ep_fd *fd,
+					  struct gwk_client_conn_data *data)
+{
+	int ret;
+
+	ret = gwk_client_create_target_fd(fd, data);
+	if (ret < 0)
+		return ret;
+
+	return gwk_client_create_circuit_fd(fd, data);
+}
+
+static void *gwk_client_handle_conn(void *data)
+{
+	struct gwk_client_conn_data *conn_data = data;
+	struct gwk_client_ep_fd fd;
+	int ret;
+
+	fd.circuit_fd = -1;
+	fd.target_fd = -1;
+	ret = gwk_client_create_circuit_pair(&fd, conn_data);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to create circuit pair: %s\n",
+			strerror(-ret));
+		goto out;
+	}
+
+out:
+	if (fd.circuit_fd != -1)
+		close(fd.circuit_fd);
+	if (fd.target_fd != -1)
+		close(fd.target_fd);
+
+	free(data);
+	return NULL;
+}
+
 static int gwk_client_handle_conn_data(struct gwk_client_ctx *ctx,
 				       struct gwk_packet *pkt, size_t len)
 {
 	struct gwk_pkt_conn_data *conn_data = &pkt->conn_data;
+	struct in_addr addr = { .s_addr = conn_data->addr };
+	struct gwk_client_conn_data *data;
+	pthread_t tid;
+	int ret;
 
 	if (!validate_conn_data_pkt(pkt, len)) {
 		fprintf(stderr, "Invalid connection data packet received!\n");
 		return -EBADMSG;
 	}
 
-	printf("Received connection data from server!\n");
+	printf("Receive a connection from %s:%hu\n", inet_ntoa(addr),
+	       ntohs(conn_data->port));
+
+	data = malloc(sizeof(*data));
+	if (!data) {
+		fprintf(stderr, "Failed to allocate memory for connection data!\n");
+		return -ENOMEM;
+	}
+
+	data->server_fd = ctx->server_fd;
+	data->s_addr = conn_data->addr;
+	data->s_port = conn_data->port;
+	data->ctx = ctx;
+	ret = pthread_create(&tid, NULL, gwk_client_handle_conn, data);
+	if (ret) {
+		fprintf(stderr, "Failed to create connection handler thread: %s\n",
+			strerror(ret));
+		free(data);
+		return -ret;
+	}
+
+	pthread_detach(tid);
 	return 0;
 }
 
@@ -1513,10 +1662,10 @@ static int gwk_client_recv(struct gwk_client_ctx *ctx)
 {
 	struct gwk_packet *pkt = &ctx->pkt;
 	ssize_t ret;
-	size_t len;
 
 	ret = recv(ctx->server_fd, pkt, sizeof(*pkt), 0);
 	if (ret < 0) {
+		ret = -errno;
 		fprintf(stderr, "Failed to receive packet: %s\n",
 			strerror(-ret));
 		return ret;
@@ -1534,37 +1683,12 @@ static int gwk_client_recv(struct gwk_client_ctx *ctx)
 	return 0;
 }
 
-static int gwk_client_poll(struct gwk_client_ctx *ctx)
-{
-	int ret;
-
-	ret = poll(ctx->poll_fds, ctx->poll_nfds, -1);
-	if (ret < 0) {
-		ret = -errno;
-		perror("poll");
-		return ret;
-	}
-
-	if (ctx->poll_fds[0].revents & POLLIN) {
-		ret = gwk_client_recv(ctx);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
 static int gwk_client_run(struct gwk_client_ctx *ctx)
 {
 	int ret = 0;
 
-	ctx->poll_fds[0].fd = ctx->server_fd;
-	ctx->poll_fds[0].events = POLLIN;
-	ctx->poll_fds[0].revents = 0;
-	ctx->poll_nfds = 1;
-
 	while (!ctx->stop) {
-		ret = gwk_client_poll(ctx);
+		ret = gwk_client_recv(ctx);
 		if (ret)
 			break;
 	}
@@ -1588,9 +1712,6 @@ static int gwk_client(struct gwk_client_ctx *ctx)
 	if (ret)
 		return ret;
 	ret = gwk_client_install_signal_handlers(ctx);
-	if (ret)
-		return ret;
-	ret = gwk_client_init_poll_fds(ctx);
 	if (ret)
 		return ret;
 	ret = gwk_client_connect_to_server(ctx);
