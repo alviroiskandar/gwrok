@@ -30,13 +30,16 @@
 #include <arpa/inet.h>
 
 #define DEFAULT_HOST		"127.0.0.1"
-#define DEFAULT_PORT		9777u
-#define DEFAULT_MAX_CLIENTS	512u
+#define DEFAULT_PORT		9777
+#define DEFAULT_MAX_CLIENTS	512
 #define POLL_FDS_ARRAY_SHIFT	1
 #define HANDSHAKE_MAGIC		"GWROK99"
-#define READ_ONCE(x)		(*(volatile __typeof__(x) *)&(x))
-#define WRITE_ONCE(x, v)	(*(volatile __typeof__(x) *)&(x) = (v))
 #define SIG_MAGIC		0xdeadbeef
+#define FORWARD_BUFFER_SIZE	4096
+#define SERVER_PFDS_IDX_SHIFT	1
+
+#define READ_ONCE(x)		(*(volatile __typeof__(x) *)&(x))
+#define WRITE_ONCE(x, v)	*(volatile __typeof__(x) *)&(x) = (v)
 
 #ifndef __packed
 #define __packed		__attribute__((__packed__))
@@ -62,89 +65,46 @@ struct pkt_handshake {
 	char		magic[sizeof(HANDSHAKE_MAGIC)];
 } __packed;
 
-struct pkt_eph_addr {
-	union {
-		struct in_addr	addr4;
-		struct in6_addr	addr6;
-	};
-	uint16_t	port;
-	uint8_t		type;
+struct pkt_addr {
+	uint8_t		family;
 	uint8_t		__pad;
+	uint16_t	port;
+	union {
+		struct in_addr	v4;
+		struct in6_addr	v6;
+	};
 } __packed;
 
 struct pkt_slave_conn {
-	union {
-		struct in_addr	addr4;
-		struct in6_addr	addr6;
-	};
-	uint16_t	port;
-	uint8_t		type;
-	uint32_t	slave_idx;
-	uint32_t	client_idx;
+	uint32_t		slave_idx;
+	uint32_t		master_idx;
+	struct pkt_addr		addr;
 } __packed;
 
 struct pkt {
 	struct pkt_hdr	hdr;
 	union {
 		struct pkt_handshake	handshake;
-		struct pkt_eph_addr	eph_addr;
+		struct pkt_addr		eph_addr_data;
 		struct pkt_slave_conn	slave_conn;
 		struct pkt_slave_conn	slave_conn_back;
-		uint8_t			__data[512];
+		uint8_t			__data[512 - sizeof(struct pkt_hdr)];
 	};
 } __packed;
 
 #define PKT_HDR_SIZE		(sizeof(struct pkt_hdr))
 #define PKT_HANDSHAKE_SIZE	(PKT_HDR_SIZE + sizeof(struct pkt_handshake))
-#define PKT_EPH_ADDR_DATA_SIZE	(PKT_HDR_SIZE + sizeof(struct pkt_eph_addr))
+#define PKT_EPH_ADDR_DATA_SIZE	(PKT_HDR_SIZE + sizeof(struct pkt_addr))
 
 struct stack32 {
-	uint32_t	rsp;
 	uint32_t	rbp;
+	uint32_t	rsp;
 	uint32_t	data[];
 };
 
 struct free_slot {
+	pthread_mutex_t		lock;
 	struct stack32		*stack;
-	pthread_mutex_t		lock;
-};
-
-struct gwk_slave_conn {
-	int			fd;
-	struct sockaddr_storage	addr;
-};
-
-struct gwk_slave_buffer {
-	size_t			len;
-	uint8_t			buf[4096];
-};
-
-struct gwk_slave_entry {
-	size_t			allocated;
-	size_t			nr_used;
-	pthread_mutex_t		lock;
-	nfds_t			poll_nfds;
-	struct pollfd		*poll_fds;
-	int			*c_fds;
-	struct gwk_slave_conn	*entries;
-	struct free_slot	fs;
-	struct gwk_slave_buffer	*bufs;
-};
-
-struct gwk_client_entry {
-	int				fd;
-	int				eph_fd;
-	uint32_t			idx;
-	struct sockaddr_storage		src_addr;
-	struct sockaddr_storage		eph_addr;
-	struct gwk_slave_entry		slave;
-	struct pkt			pkt;
-	size_t				pkt_len;
-	pthread_t			eph_thread;
-	bool				need_join;
-	bool				handshake_ok;
-	volatile bool			stop;
-	volatile bool			being_waited;
 };
 
 struct gwk_server_cfg {
@@ -155,23 +115,82 @@ struct gwk_server_cfg {
 	bool			verbose;
 };
 
-struct gwk_server_ctx {
-	volatile bool		stop;
-	int			sig;
-	int			tcp_fd;
-	struct gwk_server_cfg	cfg;
-	struct sockaddr_storage	shared_addr;
-	struct gwk_client_entry	*clients;
-	struct pollfd		*poll_fds;
-	nfds_t			poll_nfds;
-	struct free_slot	clients_fs;
-	struct pkt		pkt;
-	const char		*app;
+struct gwk_pollfds {
+	uint32_t		capacity;
+	nfds_t			nfds;
+	struct pollfd		fds[];
 };
 
-struct gwk_server_epht {
-	struct gwk_server_ctx	*ctx;
-	struct gwk_client_entry	*client;
+struct gwk_slave_entry {
+	int		target_fd;
+	int		circuit_fd;
+	uint32_t	idx;
+	uint16_t	target_buf_len;
+	uint16_t	circuit_buf_len;
+	uint8_t		*target_buf;
+	uint8_t		*circuit_buf;
+};
+
+struct gwk_client_entry {
+	/*
+	 * The primary file descriptor used to communicate with the client.
+	 */
+	int				fd;
+
+	/*
+	 * The ephemeral socket file descriptor.
+	 */
+	int				eph_fd;
+
+	/*
+	 * The index of this client.
+	 */
+	uint32_t			idx;
+
+	/*
+	 * The source address of this client.
+	 */
+	struct sockaddr_storage		src_addr;
+
+	/*
+	 * The bind address of the ephemeral socket.
+	 */
+	struct sockaddr_storage		eph_addr;
+
+	struct gwk_pollfds		*pollfds;
+	struct gwk_slave_entry		*slaves;
+	struct free_slot		slave_fs;
+
+	struct pkt			spkt;
+	struct pkt			rpkt;
+	size_t				spkt_len;
+	size_t				rpkt_len;
+
+	/*
+	 * The thread that runs the ephemeral socket.
+	 */
+	pthread_t			eph_thread;
+
+	volatile bool			stop;
+	bool				used;
+	bool				need_join;
+	bool				handshake_ok;
+};
+
+struct gwk_server_ctx {
+	volatile bool			stop;
+	int				sig;
+	int				tcp_fd;
+	struct gwk_pollfds		*pollfds;
+	struct gwk_client_entry		*clients;
+	struct free_slot		client_fs;
+	struct sockaddr_storage		shared_addr;
+	struct gwk_server_cfg		cfg;
+
+	/*
+	 * Save the first argv.
+	 */
+	const char			*app;
 };
 
 struct gwk_client_cfg {
@@ -184,19 +203,23 @@ struct gwk_client_cfg {
 };
 
 struct gwk_client_ctx {
-	volatile bool		stop;
-	int			sig;
-	int			tcp_fd;
-	struct pkt		pkt;
-	struct pkt		pkt_r;
-	size_t			pkt_rlen;
-	struct sockaddr_storage	target_addr;
-	struct sockaddr_storage	server_addr;
-	struct gwk_client_cfg	cfg;
-	struct gwk_slave_buffer	*slave_bufs;
-	struct pollfd		*poll_fds;
-	nfds_t			poll_nfds;
-	const char		*app;
+	volatile bool			stop;
+	int				sig;
+	int				tcp_fd;
+	struct gwk_pollfds		*pollfds;
+	struct gwk_slave_entry		*slaves;
+	struct free_slot		slave_fs;
+	struct pkt			pkt;
+	struct pkt			rx_pkt;
+	size_t				rx_pkt_len;
+	struct sockaddr_storage		target_addr;
+	struct sockaddr_storage		server_addr;
+	struct gwk_client_cfg		cfg;
+
+	/*
+	 * Save the first argv.
+	 */
+	const char			*app;
 };
 
 static const struct option gwk_server_long_opts[] = {
@@ -265,33 +288,6 @@ static void show_client_usage(const char *app)
 	printf("\n");
 }
 
-static const char *sa_addr(struct sockaddr_storage *sa)
-{
-	static __thread char buf[INET6_ADDRSTRLEN + 1];
-	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
-	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
-
-	if (sa->ss_family == AF_INET6)
-		return inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
-	else if (sa->ss_family == AF_INET)
-		return inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
-	else
-		return "Invalid";
-}
-
-static uint16_t sa_port(struct sockaddr_storage *sa)
-{
-	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
-	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
-
-	if (sa->ss_family == AF_INET6)
-		return ntohs(sin6->sin6_port);
-	else if (sa->ss_family == AF_INET)
-		return ntohs(sin->sin_port);
-	else
-		return 0;
-}
-
 static int get_port(const char *str)
 {
 	int ret;
@@ -304,30 +300,6 @@ static int get_port(const char *str)
 	}
 
 	return ret;
-}
-
-static void gwk_server_set_default_values(struct gwk_server_ctx *ctx)
-{
-	struct gwk_server_cfg *cfg = &ctx->cfg;
-
-	ctx->tcp_fd = -1;
-	cfg->bind_addr = "0.0.0.0";
-	cfg->bind_port = DEFAULT_PORT;
-	cfg->max_clients = DEFAULT_MAX_CLIENTS;
-	cfg->verbose = false;
-}
-
-static void gwk_client_set_default_values(struct gwk_client_ctx *ctx)
-{
-	struct gwk_client_cfg *cfg = &ctx->cfg;
-
-	ctx->tcp_fd = -1;
-	cfg->server_addr = DEFAULT_HOST;
-	cfg->server_port = DEFAULT_PORT;
-	cfg->target_addr = NULL;
-	cfg->target_port = 0;
-	cfg->max_clients = DEFAULT_MAX_CLIENTS;
-	cfg->verbose = false;
 }
 
 static int gwk_server_parse_args(int argc, char *argv[],
@@ -420,6 +392,73 @@ static int gwk_client_parse_args(int argc, char *argv[],
 	return 0;
 }
 
+static void gwk_server_ctx_init(struct gwk_server_ctx *ctx, const char *app)
+{
+	struct gwk_server_cfg *cfg = &ctx->cfg;
+
+	memset(ctx, 0, sizeof(*ctx));
+
+	cfg->bind_addr = DEFAULT_HOST;
+	cfg->bind_port = DEFAULT_PORT;
+	cfg->max_clients = DEFAULT_MAX_CLIENTS;
+	ctx->tcp_fd = -1;
+	ctx->app = app;
+}
+
+static void gwk_client_ctx_init(struct gwk_client_ctx *ctx, const char *app)
+{
+	struct gwk_client_cfg *cfg = &ctx->cfg;
+
+	memset(ctx, 0, sizeof(*ctx));
+
+	cfg->server_addr = DEFAULT_HOST;
+	cfg->server_port = DEFAULT_PORT;
+	cfg->max_clients = DEFAULT_MAX_CLIENTS;
+	ctx->tcp_fd = -1;
+	ctx->app = app;
+}
+
+static const char *sa_addr(struct sockaddr_storage *sa)
+{
+	static __thread char buf[INET6_ADDRSTRLEN + 1];
+	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+
+	if (sa->ss_family == AF_INET6)
+		return inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
+	else if (sa->ss_family == AF_INET)
+		return inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+	else
+		return "[Invalid]";
+}
+
+static uint16_t sa_port(struct sockaddr_storage *sa)
+{
+	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+
+	if (sa->ss_family == AF_INET6)
+		return ntohs(sin6->sin6_port);
+	else if (sa->ss_family == AF_INET)
+		return ntohs(sin->sin_port);
+	else
+		return 0;
+}
+
+static bool validate_pkt_addr(struct pkt_addr *pa, size_t len)
+{
+	if (len < sizeof(*pa))
+		return false;
+
+	if (pa->family != 4 && pa->family != 6)
+		return false;
+
+	if (pa->__pad != 0)
+		return false;
+
+	return true;
+}
+
 static bool validate_pkt_handshake(struct pkt *pkt, size_t len)
 {
 	struct pkt_handshake *hs = &pkt->handshake;
@@ -461,7 +500,7 @@ static bool validate_pkt_reserve_ephemeral_port(struct pkt *pkt, size_t len)
 
 static bool validate_pkt_ephemeral_addr_data(struct pkt *pkt, size_t len)
 {
-	struct pkt_eph_addr *eph = &pkt->eph_addr;
+	struct pkt_addr *eph = &pkt->eph_addr_data;
 
 	if (len < PKT_HDR_SIZE + sizeof(*eph))
 		return false;
@@ -475,7 +514,7 @@ static bool validate_pkt_ephemeral_addr_data(struct pkt *pkt, size_t len)
 	if (ntohs(pkt->hdr.len) != sizeof(*eph))
 		return false;
 
-	if (eph->type != 4 && eph->type != 6)
+	if (!validate_pkt_addr(eph, sizeof(*eph)))
 		return false;
 
 	return true;
@@ -531,7 +570,7 @@ static bool validate_pkt_server_slave_conn(struct pkt *pkt, size_t len)
 	if (ntohs(pkt->hdr.len) != sizeof(*slave))
 		return false;
 
-	if (slave->type != 4 && slave->type != 6)
+	if (!validate_pkt_addr(&slave->addr, sizeof(slave->addr)))
 		return false;
 
 	return true;
@@ -553,7 +592,7 @@ static bool validate_pkt_client_slave_conn_back(struct pkt *pkt, size_t len)
 	if (ntohs(pkt->hdr.len) != sizeof(*slave))
 		return false;
 
-	if (slave->type != 4 && slave->type != 6)
+	if (!validate_pkt_addr(&slave->addr, sizeof(slave->addr)))
 		return false;
 
 	return true;
@@ -583,7 +622,7 @@ static size_t prep_pkt_ephemeral_addr_data(struct pkt *pkt,
 {
 	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
 	struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-	struct pkt_eph_addr *eph = &pkt->eph_addr;
+	struct pkt_addr *eph = &pkt->eph_addr_data;
 
 	pkt->hdr.type = PKT_TYPE_EPHEMERAL_ADDR_DATA;
 	pkt->hdr.flags = 0;
@@ -594,14 +633,15 @@ static size_t prep_pkt_ephemeral_addr_data(struct pkt *pkt,
 	 * endianness. Because it is only 8 bits in size.
 	 */
 	if (addr->ss_family == AF_INET6) {
-		eph->type = 6;
-		eph->addr6 = sin6->sin6_addr;
+		eph->family = 6;
+		eph->v6 = sin6->sin6_addr;
 		eph->port = sin6->sin6_port;
 	} else {
-		eph->type = 4;
-		eph->addr4 = sin->sin_addr;
+		eph->family = 4;
+		eph->v4 = sin->sin_addr;
 		eph->port = sin->sin_port;
 	}
+	eph->__pad = 0;
 
 	return PKT_HDR_SIZE + sizeof(*eph);
 }
@@ -622,7 +662,7 @@ static size_t prep_pkt_server_ack(struct pkt *pkt)
 	return PKT_HDR_SIZE;
 }
 
-static size_t prep_pkt_server_slave_conn(struct pkt *pkt, uint32_t client_idx,
+static size_t prep_pkt_server_slave_conn(struct pkt *pkt, uint32_t master_idx,
 					 uint32_t slave_idx,
 					 struct sockaddr_storage *addr)
 {
@@ -634,7 +674,7 @@ static size_t prep_pkt_server_slave_conn(struct pkt *pkt, uint32_t client_idx,
 	pkt->hdr.flags = 0;
 	pkt->hdr.len = htons((uint16_t)sizeof(*conn));
 
-	conn->client_idx = htonl(client_idx);
+	conn->master_idx = htonl(master_idx);
 	conn->slave_idx = htonl(slave_idx);
 
 	/*
@@ -642,20 +682,21 @@ static size_t prep_pkt_server_slave_conn(struct pkt *pkt, uint32_t client_idx,
 	 * endianness. Because it is only 8 bits in size.
 	 */
 	if (addr->ss_family == AF_INET6) {
-		conn->type = 6;
-		conn->addr6 = sin6->sin6_addr;
-		conn->port = sin6->sin6_port;
+		conn->addr.family = 6;
+		conn->addr.v6 = sin6->sin6_addr;
+		conn->addr.port = sin6->sin6_port;
 	} else {
-		conn->type = 4;
-		conn->addr4 = sin->sin_addr;
-		conn->port = sin->sin_port;
+		conn->addr.family = 4;
+		conn->addr.v4 = sin->sin_addr;
+		conn->addr.port = sin->sin_port;
 	}
+	conn->addr.__pad = 0;
 
 	return PKT_HDR_SIZE + sizeof(*conn);
 }
 
 static size_t prep_pkt_client_slave_conn_back(struct pkt *pkt,
-					      uint32_t client_idx,
+					      uint32_t master_idx,
 					      uint32_t slave_idx,
 					      struct sockaddr_storage *addr)
 {
@@ -667,7 +708,7 @@ static size_t prep_pkt_client_slave_conn_back(struct pkt *pkt,
 	pkt->hdr.flags = 0;
 	pkt->hdr.len = htons((uint16_t)sizeof(*conn));
 
-	conn->client_idx = htonl(client_idx);
+	conn->master_idx = htonl(master_idx);
 	conn->slave_idx = htonl(slave_idx);
 
 	/*
@@ -675,16 +716,87 @@ static size_t prep_pkt_client_slave_conn_back(struct pkt *pkt,
 	 * endianness. Because it is only 8 bits in size.
 	 */
 	if (addr->ss_family == AF_INET6) {
-		conn->type = 6;
-		conn->addr6 = sin6->sin6_addr;
-		conn->port = sin6->sin6_port;
+		conn->addr.family = 6;
+		conn->addr.v6 = sin6->sin6_addr;
+		conn->addr.port = sin6->sin6_port;
 	} else {
-		conn->type = 4;
-		conn->addr4 = sin->sin_addr;
-		conn->port = sin->sin_port;
+		conn->addr.family = 4;
+		conn->addr.v4 = sin->sin_addr;
+		conn->addr.port = sin->sin_port;
 	}
+	conn->addr.__pad = 0;
 
 	return PKT_HDR_SIZE + sizeof(*conn);
+}
+
+static struct gwk_slave_entry *alloc_slave_entries(uint32_t nentries)
+{
+	struct gwk_slave_entry *ret;
+	uint32_t i;
+
+	ret = malloc(sizeof(*ret) * nentries);
+	if (!ret)
+		return NULL;
+
+	for (i = 0; i < nentries; i++) {
+		ret[i].circuit_fd = -1;
+		ret[i].target_fd = -1;
+		ret[i].idx = i;
+		ret[i].circuit_buf_len = 0;
+		ret[i].target_buf_len = 0;
+		ret[i].circuit_buf = NULL;
+		ret[i].target_buf = NULL;
+	}
+
+	return ret;
+}
+
+static void free_slave_entries(struct gwk_slave_entry *slaves, uint32_t nr)
+{
+	uint32_t i;
+
+	if (!slaves)
+		return;
+
+	for (i = 0; i < nr; i++) {
+		struct gwk_slave_entry *slave = &slaves[i];
+
+		if (slave->circuit_fd >= 0)
+			close(slave->circuit_fd);
+		if (slave->target_fd >= 0)
+			close(slave->target_fd);
+		if (slave->circuit_buf)
+			free(slave->circuit_buf);
+		if (slave->target_buf)
+			free(slave->target_buf);
+	}
+
+	free(slaves);
+}
+
+static struct gwk_pollfds *alloc_gwk_pollfds(uint32_t capacity)
+{
+	struct gwk_pollfds *ret;
+	uint32_t i;
+
+	ret = malloc(sizeof(*ret) + sizeof(ret->fds[0]) * capacity);
+	if (!ret)
+		return NULL;
+
+	for (i = 0; i < capacity; i++) {
+		ret->fds[i].fd = -1;
+		ret->fds[i].events = 0;
+		ret->fds[i].revents = 0;
+	}
+
+	ret->capacity = capacity;
+	ret->nfds = 0;
+	return ret;
+}
+
+static void free_gwk_pollfds(struct gwk_pollfds *pfds)
+{
+	free(pfds);
 }
 
 static int init_free_slot(struct free_slot *fs, uint32_t max)
@@ -715,206 +827,6 @@ static int init_free_slot(struct free_slot *fs, uint32_t max)
 	return 0;
 }
 
-static int up_size_free_slot(struct free_slot *fs, uint32_t max)
-{
-	struct stack32 *stack;
-	uint32_t old_rbp;
-	uint32_t old_rsp;
-	uint32_t new_rsp;
-	uint32_t new_rbp;
-	uint32_t *data;
-	uint32_t i;
-	int ret = 0;
-
-	pthread_mutex_lock(&fs->lock);
-	/*
-	 * @max has to be greater than the current max. Otherwise, we
-	 * will lose track of the free slots.
-	 */
-	if (max <= fs->stack->rbp) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	stack = realloc(fs->stack, sizeof(*stack) + sizeof(stack->data[0]) * max);
-	if (!stack) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	/*
-	 * Expert only, don't try this at home!
-	 */
-	i = max;
-	data = stack->data;
-	old_rbp = stack->rbp;
-	old_rsp = stack->rsp;
-	new_rsp = old_rsp + (max - old_rbp);
-	new_rbp = max;
-	memmove(&data[new_rsp], &data[old_rsp], sizeof(data[0]) * (old_rbp - old_rsp));
-	stack->rbp = new_rbp;
-	stack->rsp = new_rsp;
-
-	/* Whee... */
-	while (i > old_rbp)
-		data[--stack->rsp] = --i;
-
-	fs->stack = stack;
-out:
-	pthread_mutex_unlock(&fs->lock);
-	return ret;
-}
-
-static void destroy_free_slot(struct free_slot *fs)
-{
-	pthread_mutex_destroy(&fs->lock);
-	free(fs->stack);
-	memset(fs, 0, sizeof(*fs));
-}
-
-static int init_slave_entries(struct gwk_slave_entry *se, uint32_t max)
-{
-	struct gwk_slave_conn *entries;
-	struct gwk_slave_buffer *bufs;
-	struct pollfd *p_fds;
-	uint32_t i;
-	int *c_fds;
-	int ret;
-
-	c_fds = calloc(max, sizeof(*c_fds));
-	p_fds = calloc((max + 1u) * 2u, sizeof(*p_fds));
-	entries = calloc(max, sizeof(*entries));
-	bufs = calloc((max + 1u) * 2u, sizeof(*bufs));
-	if (!c_fds || !p_fds || !entries || !bufs) {
-		ret = -ENOMEM;
-		goto out_free_callocs;
-	}
-
-	ret = init_free_slot(&se->fs, max);
-	if (ret)
-		goto out_free_callocs;
-
-	ret = pthread_mutex_init(&se->lock, NULL);
-	if (ret) {
-		ret = -ret;
-		goto out_free_slot;
-	}
-
-	for (i = 0; i < max; i++) {
-		c_fds[i] = -1;
-		p_fds[i].fd = -1;
-		entries[i].fd = -1;
-	}
-
-	se->allocated = max;
-	se->nr_used = 0;
-	se->c_fds = c_fds;
-	se->poll_fds = p_fds;
-	se->entries = entries;
-	se->bufs = bufs;
-	se->poll_nfds = 0;
-	return 0;
-
-out_free_slot:
-	destroy_free_slot(&se->fs);
-out_free_callocs:
-	free(c_fds);
-	free(p_fds);
-	free(entries);
-	free(bufs);
-	return ret;
-}
-
-static int up_size_slave_entries(struct gwk_slave_entry *se)
-{
-	struct gwk_slave_conn *entries;
-	size_t i, new_size, old_size;
-	struct pollfd *p_fds;
-	int *c_fds;
-	int ret;
-
-	pthread_mutex_lock(&se->lock);
-	old_size = se->allocated;
-	new_size = old_size * 2u + 1u;
-
-	c_fds = realloc(se->c_fds, new_size * sizeof(*c_fds));
-	if (!c_fds) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	p_fds = realloc(se->poll_fds, (new_size * 2u + 1u) * sizeof(*p_fds));
-	if (!p_fds) {
-		se->c_fds = c_fds;
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	entries = realloc(se->entries, new_size * sizeof(*entries));
-	if (!entries) {
-		se->poll_fds = p_fds;
-		se->c_fds = c_fds;
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	ret = up_size_free_slot(&se->fs, new_size);
-	if (ret) {
-		se->entries = entries;
-		se->poll_fds = p_fds;
-		se->c_fds = c_fds;
-		goto out;
-	}
-
-	for (i = old_size; i < new_size; i++) {
-		c_fds[i] = -1;
-		p_fds[i].fd = -1;
-		p_fds[i].events = 0;
-		p_fds[i].revents = 0;
-		entries[i].fd = -1;
-		memset(&entries[i].addr, 0, sizeof(entries[i].addr));
-	}
-
-	se->allocated = new_size;
-	se->c_fds = c_fds;
-	se->poll_fds = p_fds;
-	se->entries = entries;
-out:
-	pthread_mutex_unlock(&se->lock);
-	return ret;
-}
-
-static void destroy_slave_entries(struct gwk_slave_entry *se)
-{
-	uint32_t i;
-
-	if (!se->entries)
-		return;
-
-	pthread_mutex_lock(&se->lock);
-	for (i = 0; i < se->allocated; i++) {
-		if (se->c_fds[i] != -1) {
-			close(se->c_fds[i]);
-			se->c_fds[i] = -1;
-		}
-		if (se->entries[i].fd != -1) {
-			close(se->entries[i].fd);
-			se->entries[i].fd = -1;
-		}
-		if (se->poll_fds[i].fd != -1)
-			se->poll_fds[i].fd = -1;
-	}
-	pthread_mutex_unlock(&se->lock);
-
-	pthread_mutex_destroy(&se->lock);
-	free(se->c_fds);
-	free(se->poll_fds);
-	free(se->entries);
-	free(se->bufs);
-	destroy_free_slot(&se->fs);
-	memset(se, 0, sizeof(*se));
-}
-
 static int64_t push_free_slot(struct free_slot *fs, uint32_t data)
 {
 	struct stack32 *stack = fs->stack;
@@ -943,6 +855,15 @@ static int64_t pop_free_slot(struct free_slot *fs)
 		ret = stack->data[stack->rsp++];
 	pthread_mutex_unlock(&fs->lock);
 	return ret;
+}
+
+static void destroy_free_slot(struct free_slot *fs)
+{
+	if (fs->stack) {
+		pthread_mutex_destroy(&fs->lock);
+		free(fs->stack);
+		memset(fs, 0, sizeof(*fs));
+	}
 }
 
 static int fill_addr_storage(struct sockaddr_storage *addr_storage,
@@ -1003,6 +924,9 @@ static void gwk_server_signal_handler(int sig)
 		return;
 
 	if (sig_magic != SIG_MAGIC) {
+		/*
+		 * The signal is caught not by the main thread.
+		 */
 		g_client_entry->stop = true;
 		return;
 	}
@@ -1056,7 +980,7 @@ static void reset_client_entry(struct gwk_client_entry *c)
 
 static int gwk_server_init_client_entries(struct gwk_server_ctx *ctx)
 {
-	struct gwk_client_entry *clients, *c;
+	struct gwk_client_entry *clients;
 	uint32_t i;
 	int ret;
 
@@ -1064,16 +988,18 @@ static int gwk_server_init_client_entries(struct gwk_server_ctx *ctx)
 	if (!clients)
 		return -ENOMEM;
 
-	ret = init_free_slot(&ctx->clients_fs, ctx->cfg.max_clients);
+	ret = init_free_slot(&ctx->client_fs, ctx->cfg.max_clients);
 	if (ret) {
 		free(clients);
 		return ret;
 	}
 
 	for (i = 0; i < ctx->cfg.max_clients; i++) {
-		c = &clients[i];
-		c->idx = i;
-		reset_client_entry(c);
+		struct gwk_client_entry *client;
+
+		client = &clients[i];
+		client->idx = i;
+		reset_client_entry(client);
 	}
 
 	ctx->clients = clients;
@@ -1142,109 +1068,31 @@ static int gwk_server_init_socket(struct gwk_server_ctx *ctx)
 
 static int gwk_server_init_pollfds(struct gwk_server_ctx *ctx)
 {
-	struct pollfd *poll_fds;
-	size_t nr, i;
-
-	nr = ctx->cfg.max_clients + POLL_FDS_ARRAY_SHIFT;
-	poll_fds = calloc(nr, sizeof(*poll_fds));
-	if (!poll_fds)
+	/*
+	 * +1 for the main TCP socket that accepts new connections.
+	 */
+	ctx->pollfds = alloc_gwk_pollfds(ctx->cfg.max_clients + 1u);
+	if (!ctx->pollfds)
 		return -ENOMEM;
 
-	poll_fds[0].fd = ctx->tcp_fd;
-	poll_fds[0].events = POLLIN;
-	for (i = 1; i < nr; i++)
-		poll_fds[i].fd = -1;
-
-	ctx->poll_fds = poll_fds;
-	ctx->poll_nfds = 1;
 	return 0;
 }
 
-static int gwk_server_assign_client(struct gwk_server_ctx *ctx, int fd,
-				    struct sockaddr_storage *addr)
+static void gwk_server_put_client_entry(struct gwk_server_ctx *ctx,
+					struct gwk_client_entry *client)
 {
-	struct gwk_client_entry *client;
-	struct pollfd *pfd;
-	nfds_t new_nfds;
-	int64_t idx;
+	struct gwk_server_cfg *cfg = &ctx->cfg;
 
-	idx = pop_free_slot(&ctx->clients_fs);
-	if (idx < 0) {
-		fprintf(stderr, "Slot is full, cannot accept more client.\n");
-		close(fd);
-		return 0;
-	}
-
-	client = &ctx->clients[idx];
-	client->fd = fd;
-	client->src_addr = *addr;
-	assert(client->idx == (uint32_t)idx);
-
-	new_nfds = idx + POLL_FDS_ARRAY_SHIFT;
-	pfd = &ctx->poll_fds[new_nfds];
-	pfd->fd = fd;
-	pfd->events = POLLIN;
-	pfd->revents = 0;
-
-	if (ctx->poll_nfds <= new_nfds)
-		ctx->poll_nfds = new_nfds + 1;
-
-	printf("Accepted a new client (fd=%d, idx=%u, addr=%s:%hu)\n", fd,
-	       (uint32_t)idx, sa_addr(addr), sa_port(addr));
-	return 0;
-}
-
-static int _gwk_server_handle_accept(struct gwk_server_ctx *ctx)
-{
-	struct sockaddr_storage addr;
-	socklen_t len;
-	int ret;
-
-	memset(&addr, 0, sizeof(addr));
-	len = sizeof(addr);
-	ret = accept(ctx->tcp_fd, (struct sockaddr *)&addr, &len);
-	if (ret < 0) {
-		ret = -errno;
-		perror("accept");
-		return ret;
-	}
-
-	return gwk_server_assign_client(ctx, ret, &addr);
-}
-
-static int gwk_server_handle_accept(struct gwk_server_ctx *ctx,
-				    struct pollfd *pfd)
-{
-	if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
-		fprintf(stderr, "Error on polling the accept socket\n");
-		return -EIO;
-	}
-
-	if (!(pfd->revents & POLLIN))
-		return -EAGAIN;
-
-
-	return _gwk_server_handle_accept(ctx);
-}
-
-static int gwk_server_close_client(struct gwk_server_ctx *ctx,
-				   struct gwk_client_entry *client)
-{
-	struct pollfd *pfd;
-	int ret;
-
-	pfd = &ctx->poll_fds[client->idx + POLL_FDS_ARRAY_SHIFT];
-	pfd->fd = -1;
-	pfd->events = 0;
-	pfd->revents = 0;
-
-	client->being_waited = true;
-	printf("Closing client (fd=%d, idx=%u, addr=%s:%hu)\n",
-	       client->fd, client->idx, sa_addr(&client->src_addr),
-	       sa_port(&client->src_addr));
-
+	assert(client->used);
 	client->stop = true;
-	assert(client->fd >= 0 || client->fd == -2);
+
+	if (client->need_join) {
+		pthread_kill(client->eph_thread, SIGUSR1);
+		pthread_join(client->eph_thread, NULL);
+	}
+
+	if (client->slaves)
+		free_slave_entries(client->slaves, cfg->max_clients);
 
 	if (client->fd >= 0)
 		close(client->fd);
@@ -1252,40 +1100,123 @@ static int gwk_server_close_client(struct gwk_server_ctx *ctx,
 	if (client->eph_fd >= 0)
 		close(client->eph_fd);
 
-	if (client->need_join) {
-		pthread_kill(client->eph_thread, SIGTERM);
-		ret = pthread_join(client->eph_thread, NULL);
-		assert(ret == 0);
-		(void)ret;
-	}
+	if (client->pollfds)
+		free_gwk_pollfds(client->pollfds);
 
 	reset_client_entry(client);
-	ret = push_free_slot(&ctx->clients_fs, client->idx);
-	assert(ret == 0);
-	(void)ret;
+	push_free_slot(&ctx->client_fs, client->idx);
+}
+
+static void gwk_server_close_client(struct gwk_server_ctx *ctx,
+				    struct gwk_client_entry *client)
+{
+	return gwk_server_put_client_entry(ctx, client);
+}
+
+static void gwk_server_pfds_assign_fd(struct gwk_pollfds *pfds, int fd,
+				      uint32_t idx)
+{
+	nfds_t new_nfds;
+
+	idx += SERVER_PFDS_IDX_SHIFT;
+	pfds->fds[idx].fd = fd;
+	pfds->fds[idx].events = POLLIN;
+	pfds->fds[idx].revents = 0;
+
+	new_nfds = idx + 1;
+	if (new_nfds > pfds->nfds)
+		pfds->nfds = new_nfds;
+
+	assert((uint32_t)new_nfds <= pfds->capacity);
+}
+
+static void gwk_server_set_pollout(struct gwk_pollfds *pfds, uint32_t idx)
+{
+	struct pollfd *pfd = &pfds->fds[idx + SERVER_PFDS_IDX_SHIFT];
+
+	assert(pfd->fd >= 0);
+	pfd->events |= POLLOUT;
+}
+
+static void gwk_server_clear_pollout(struct gwk_pollfds *pfds, uint32_t idx)
+{
+	struct pollfd *pfd = &pfds->fds[idx + SERVER_PFDS_IDX_SHIFT];
+
+	assert(pfd->fd >= 0);
+	pfd->events &= ~POLLOUT;
+}
+
+static int gwk_server_assign_client(struct gwk_server_ctx *ctx, int fd,
+				    struct sockaddr_storage *addr)
+{
+	struct gwk_client_entry *client;
+	nfds_t new_nfds;
+	uint32_t idx;
+	int64_t ret;
+
+	ret = pop_free_slot(&ctx->client_fs);
+	if (ret) {
+		fprintf(stderr, "Too many clients, dropping connection\n");
+		close(fd);
+		return 0;
+	}
+
+	idx = (uint32_t)ret;
+
+	client = &ctx->clients[idx];
+	client->fd = fd;
+	client->used = true;
+	client->src_addr = *addr;
+	gwk_server_pfds_assign_fd(ctx->pollfds, fd, idx);
+	return 0;
+}
+
+static ssize_t gwk_server_send(struct gwk_server_ctx *ctx,
+			       struct gwk_client_entry *client)
+{
+	struct pkt *pkt = &client->spkt;
+	ssize_t ret;
 
 	return 0;
+}
+
+static int gwk_server_handle_accept(struct gwk_server_ctx *ctx,
+				    struct pollfd *pfd)
+{
+	struct sockaddr_storage addr;
+	short revents = pfd->revents;
+	socklen_t len;
+	int ret;
+
+	if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+		fprintf(stderr, "Poll error on main TCP socket: %hd\n", revents);
+		return -EIO;
+	}
+
+	len = sizeof(addr);
+	ret = accept(ctx->tcp_fd, (struct sockaddr *)&addr, &len);
+	if (ret < 0) {
+
+		ret = -errno;
+		if (ret == -EAGAIN)
+			return 0;
+
+		perror("accept");
+		return ret;
+	}
+
+	return gwk_server_assign_client(ctx, ret, &addr);
 }
 
 static int gwk_server_respond_handshake(struct gwk_server_ctx *ctx,
 					struct gwk_client_entry *client)
 {
-	struct pkt *pkt = &ctx->pkt;
 	ssize_t ret;
-	size_t len;
 
-	len = prep_pkt_handshake(pkt);
-	ret = send(client->fd, pkt, len, MSG_WAITALL);
-	if (ret < 0) {
-		ret = -errno;
-		perror("send");
+	client->spkt_len = prep_pkt_handshake(&client->spkt);
+	ret = gwk_server_send(ctx, client);
+	if (ret < 0 && ret != -EINPROGRESS)
 		return ret;
-	}
-
-	if ((size_t)ret != len) {
-		fprintf(stderr, "Failed to send handshake packet\n");
-		return -EIO;
-	}
 
 	client->handshake_ok = true;
 	return 0;
@@ -1294,9 +1225,9 @@ static int gwk_server_respond_handshake(struct gwk_server_ctx *ctx,
 static int gwk_server_handle_handshake(struct gwk_server_ctx *ctx,
 				       struct gwk_client_entry *client)
 {
-	struct pkt *pkt = &client->pkt;
+	struct pkt *pkt = &client->rpkt;
 
-	if (!validate_pkt_handshake(pkt, client->pkt_len)) {
+	if (!validate_pkt_handshake(pkt, client->rpkt_len)) {
 		fprintf(stderr, "Invalid handshake packet\n");
 		return -EBADMSG;
 	}
@@ -1314,570 +1245,50 @@ static int gwk_server_handle_handshake(struct gwk_server_ctx *ctx,
 	return gwk_server_respond_handshake(ctx, client);
 }
 
-static int allocate_ephemeral_port(struct sockaddr_storage *addr,
-				   struct sockaddr_storage *eph_addr)
+static int gwk_server_handle_packet(struct gwk_server_ctx *ctx,
+				    struct gwk_client_entry *client)
 {
-	struct sockaddr_storage shared_addr = *addr;
-	socklen_t old_len;
-	socklen_t len;
-	int ret;
-	int fd;
-
-	fd = create_sock_and_bind(&shared_addr);
-	if (fd < 0)
-		return fd;
-
-	if (shared_addr.ss_family == AF_INET)
-		len = sizeof(struct sockaddr_in);
-	else
-		len = sizeof(struct sockaddr_in6);
-
-	old_len = len;
-	memset(eph_addr, 0, sizeof(*eph_addr));
-	ret = getsockname(fd, (struct sockaddr *)eph_addr, &len);
-	if (ret < 0) {
-		ret = -errno;
-		perror("getsockname");
-		close(fd);
-		return ret;
-	}
-
-	if (old_len != len) {
-		fprintf(stderr, "getsockname returned different length (%u != %u)\n",
-			(unsigned)old_len, (unsigned)len);
-		close(fd);
-		return -EOVERFLOW;
-	}
-
-	return fd;
-}
-
-static int gwk_server_send_ephemeral_port(struct gwk_server_ctx *ctx,
-					  struct gwk_client_entry *client)
-{
-	struct pkt *pkt = &ctx->pkt;
-	ssize_t ret;
-	size_t len;
-
-	len = prep_pkt_ephemeral_addr_data(pkt, &client->eph_addr);
-	ret = send(client->fd, pkt, len, MSG_WAITALL);
-	if (ret < 0) {
-		ret = -errno;
-		perror("send");
-		return ret;
-	}
-
-	if ((size_t)ret != len) {
-		fprintf(stderr, "Failed to send ephemeral port packet\n");
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int gwk_server_handle_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
-						    struct gwk_client_entry *client)
-{
-	struct pkt *pkt = &client->pkt;
-	int ret;
-
-	if (!client->handshake_ok)
-		return -EBADMSG;
-
-	if (!validate_pkt_reserve_ephemeral_port(pkt, client->pkt_len)) {
-		fprintf(stderr, "Invalid reserve_ephemeral_port packet\n");
-		return -EBADMSG;
-	}
-
-	ret = allocate_ephemeral_port(&ctx->shared_addr, &client->eph_addr);
-	if (ret < 0) {
-		fprintf(stderr, "Failed to allocate ephemeral port: %s\n",
-			strerror(-ret));
-		return ret;
-	}
-
-	client->eph_fd = ret;
-	printf("Allocated ephemeral port %s:%hu for client (fd=%d, idx=%u, addr=%s:%hu)\n",
-	       sa_addr(&client->eph_addr), sa_port(&client->eph_addr),
-	       client->fd, client->idx, sa_addr(&client->src_addr),
-	       sa_port(&client->src_addr));
-
-	return gwk_server_send_ephemeral_port(ctx, client);
-}
-
-static int gwk_server_send_ack(struct gwk_client_entry *client)
-{
-	struct pkt pkt;
-	ssize_t ret;
-	size_t len;
-
-	len = prep_pkt_server_ack(&pkt);
-	ret = send(client->fd, &pkt, len, MSG_WAITALL);
-	if (ret < 0) {
-		ret = -errno;
-		perror("send");
-		return ret;
-	}
-
-	if ((size_t)ret != len) {
-		fprintf(stderr, "Failed to send ACK packet\n");
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int gwk_server_eph_assign_fd(struct gwk_client_entry *client, int fd,
-				    uint32_t idx, struct sockaddr_storage *addr)
-{
-	struct gwk_slave_entry *slave = &client->slave;
-	struct gwk_slave_conn *conn;
-	struct pkt pkt;
-	ssize_t ret;
-	size_t len;
-
-	pthread_mutex_lock(&slave->lock);
-	conn = &slave->entries[idx];
-	conn->fd = fd;
-	conn->addr = *addr;
-
-	len = prep_pkt_server_slave_conn(&pkt, client->idx, idx, addr);
-	ret = send(client->fd, &pkt, len, MSG_WAITALL);
-	if (ret < 0) {
-		ret = -errno;
-		perror("send");
-		pthread_mutex_unlock(&slave->lock);
-		return ret;
-	}
-
-	if ((size_t)ret != len) {
-		fprintf(stderr, "Failed to send slave_conn packet\n");
-		pthread_mutex_unlock(&slave->lock);
-		return -EIO;
-	}
-	pthread_mutex_unlock(&slave->lock);
-
-	printf("Accepted a slave connection (fd=%d, idx=%u, addr=%s:%hu)\n",
-	       fd, idx, sa_addr(addr), sa_port(addr));
-	return 0;
-}
-
-static int gwk_server_eph_accept(struct gwk_client_entry *client,
-				 struct pollfd *pfd)
-{
-	struct gwk_slave_entry *slave = &client->slave;
-	struct sockaddr_storage src_addr;
-	bool idx_popped = false;
-	socklen_t len;
-	int64_t idx;
-	int ret;
-	int fd;
-
-	if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
-		if (client->stop)
-			return 0;
-
-		return -EIO;
-	}
-
-	if (!(pfd->revents & POLLIN))
-		return -EAGAIN;
-
-	len = sizeof(src_addr);
-	fd = accept(client->eph_fd, (struct sockaddr *)&src_addr, &len);
-	if (fd < 0) {
-		ret = -errno;
-		perror("accept");
-		return ret;
-	}
-
-pop_idx:
-	idx = pop_free_slot(&slave->fs);
-	if (idx >= 0)
-		return gwk_server_eph_assign_fd(client, fd, (uint32_t)idx,
-						&src_addr);
-
-	if (idx_popped) {
-		ret = (int)idx;
-		fprintf(stderr, "Failed to pop free slot: %s\n", strerror(-ret));
-		close(fd);
-		return ret;
-	}
-
-	idx_popped = true;
-	ret = up_size_slave_entries(slave);
-	if (ret < 0) {
-		fprintf(stderr, "Failed to up size slave entries: %s\n",
-			strerror(-ret));
-		close(fd);
-		return ret;
-	}
-	goto pop_idx;
-}
-
-static int gwk_server_eph_handle_buf(struct gwk_slave_entry *slave,
-				     struct pollfd *fds, uint32_t idx)
-{
-	uint32_t shift = slave->allocated;
-	struct gwk_slave_buffer *buf;
-	uint32_t out_idx;
-	ssize_t ret;
-	size_t len;
-	int out_fd;
-	int in_fd;
-
-	if (idx >= shift)
-		out_idx = idx - shift;
-	else
-		out_idx = idx + shift;
-
-	in_fd = fds[idx].fd;
-	buf = &slave->bufs[idx];
-	len = sizeof(buf->buf) - buf->len;
-	ret = recv(in_fd, &buf->buf[buf->len], len, MSG_DONTWAIT);
-	if (ret <= 0) {
-		if (ret == 0)
-			goto out_close;
-
-		ret = -errno;
-		if (ret == -EAGAIN)
-			return 0;
-
-		perror("recv");
-		goto out_close;
-	}
-
-	buf->len += (size_t)ret;
-	out_fd = fds[out_idx].fd;
-	ret = send(out_fd, buf->buf, buf->len, MSG_DONTWAIT);
-	if (ret < 0) {
-		ret = -errno;
-		if (ret == -EAGAIN)
-			return 0;
-
-		perror("send");
-		goto out_close;
-	}
-
-out_close:
-	return 0;
-}
-
-static int gwk_server_eph_poll(struct gwk_client_entry *client)
-{
-	struct gwk_slave_entry *slave = &client->slave;
-	struct pollfd *fds;
-	nfds_t i, nfds;
-	int nr_events;
-	int ret;
-
-	fds = READ_ONCE(slave->poll_fds);
-	nfds = READ_ONCE(slave->poll_nfds);
-	printf("poll fds = %ld\n", nfds);
-	ret = poll(fds, nfds, 1000);
-	if (ret < 0) {
-		ret = -errno;
-		if (ret == -EINTR)
-			return 0;
-
-		perror("poll");
-		return ret;
-	}
-
-	if (ret == 0)
-		return 0;
-
-	nr_events = ret;
-	ret = gwk_server_eph_accept(client, &fds[0]);
-	if (ret < 0 && ret != -EAGAIN) {
-		fprintf(stderr, "Failed to accept new connection: %s\n",
-			strerror(-ret));
-		return ret;
-	} else if (ret != -EAGAIN) {
-		nr_events--;
-	}
-
-	if (!nr_events)
-		return 0;
-
-	pthread_mutex_lock(&slave->lock);
-	fds = READ_ONCE(slave->poll_fds);
-	for (i = 1; i < nfds; i++) {
-		if (!(fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
-			continue;
-
-		nr_events--;
-		gwk_server_eph_handle_buf(slave, fds, (uint32_t)i);
-	}
-	pthread_mutex_unlock(&slave->lock);
-
-	return 0;
-}
-
-static void *gwk_server_eph_thread(void *data)
-{
-	struct gwk_server_epht *epht = data;
-	struct gwk_client_entry *client = epht->client;
-	struct gwk_slave_entry *slave = &client->slave;
-	struct gwk_server_ctx *ctx = epht->ctx;
-	int ret;
-
-	g_client_entry = client;
-	free(epht);
-	ret = init_slave_entries(&client->slave, DEFAULT_MAX_CLIENTS);
-	if (ret < 0) {
-		fprintf(stderr, "Failed to initialize slave entries: %s\n",
-			strerror(-ret));
-		goto out;
-	}
-
-	ret = gwk_server_send_ack(client);
-	if (ret < 0) {
-		fprintf(stderr, "Failed to send ACK to client: %s\n",
-			strerror(-ret));
-		goto out;
-	}
-
-	slave->poll_fds[0].fd = client->eph_fd;
-	slave->poll_fds[0].events = POLLIN;
-	slave->poll_fds[0].revents = 0;
-	slave->poll_nfds = 1;
-
-	while (!client->stop) {
-		ret = gwk_server_eph_poll(client);
-		if (ret)
-			break;
-	}
-
-out:
-	destroy_slave_entries(&client->slave);
-	if (!client->being_waited) {
-		pthread_detach(client->eph_thread);
-		client->need_join = false;
-		gwk_server_close_client(ctx, client);
-	}
-	return NULL;
-}
-
-static int gwk_server_handle_client_is_ready(struct gwk_server_ctx *ctx,
-					     struct gwk_client_entry *client)
-{
-	struct pkt *pkt = &client->pkt;
-	struct gwk_server_epht *epht;
-	int ret;
-
-	if (!client->handshake_ok)
-		return -EBADMSG;
-
-	if (!validate_pkt_client_is_ready(pkt, client->pkt_len)) {
-		fprintf(stderr, "Invalid client_is_ready packet\n");
-		return -EBADMSG;
-	}
-
-	epht = malloc(sizeof(*epht));
-	if (!epht) {
-		fprintf(stderr, "Failed to allocate memory for eph thread\n");
-		return -ENOMEM;
-	}
-
-	epht->client = client;
-	epht->ctx = ctx;
-
-	ret = pthread_create(&client->eph_thread, NULL, gwk_server_eph_thread,
-			     epht);
-	if (ret) {
-		fprintf(stderr, "Failed to create eph thread: %s\n",
-			strerror(ret));
-		free(epht);
-		return -ret;
-	}
-	client->need_join = true;
-	return 0;
-}
-
-static void slave_conn_to_sockaddr(struct pkt_slave_conn *sc,
-				   struct sockaddr_storage *addr)
-{
-	memset(addr, 0, sizeof(*addr));
-	if (sc->type == 4) {
-		struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-
-		sin->sin_family = AF_INET;
-		sin->sin_port = sc->port;
-		memcpy(&sin->sin_addr, &sc->addr4, sizeof(sin->sin_addr));
-	} else {
-		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
-
-		sin6->sin6_family = AF_INET6;
-		sin6->sin6_port = sc->port;
-		memcpy(&sin6->sin6_addr, &sc->addr6, sizeof(sin6->sin6_addr));
-	}
-}
-
-static bool slave_conn_cmp_sockaddr(struct pkt_slave_conn *sc,
-				    struct sockaddr_storage *addr)
-{
-	if (sc->type == 4) {
-		struct sockaddr_in *s = (struct sockaddr_in *)addr;
-
-		if (s->sin_family != AF_INET)
-			return false;
-		
-		if (memcmp(&s->sin_addr, &sc->addr4, sizeof(s->sin_addr)))
-			return false;
-
-		if (s->sin_port != sc->port)
-			return false;
-	} else {
-		struct sockaddr_in6 *s = (struct sockaddr_in6 *)addr;
-
-		if (s->sin6_family != AF_INET6)
-			return false;
-		
-		if (memcmp(&s->sin6_addr, &sc->addr6, sizeof(s->sin6_addr)))
-			return false;
-
-		if (s->sin6_port != sc->port)
-			return false;
-	}
-
-	return true;
-}
-
-static int _gwk_server_assign_conn_back(struct gwk_client_entry *client,
-					struct gwk_slave_entry *slave,
-					uint32_t slave_idx,
-					struct pkt_slave_conn *conn)
-{
-	struct pollfd *fds = READ_ONCE(slave->poll_fds);
-	uint32_t shift = slave->allocated;
-	struct gwk_slave_conn *sconn;
-	nfds_t new_nfds;
-
-	sconn = &slave->entries[slave_idx];
-
-	if (!slave_conn_cmp_sockaddr(conn, &sconn->addr)) {
-		fprintf(stderr, "Slave connection address mismatch\n");
-		return -EINVAL;
-	}
-
-	fds[slave_idx + 1].fd = sconn->fd;
-	fds[slave_idx + 1].events = POLLIN;
-	fds[slave_idx + 1].revents = 0;
-
-	fds[shift + slave_idx + 1].fd = client->fd;
-	fds[shift + slave_idx + 1].events = POLLIN;
-	fds[shift + slave_idx + 1].revents = 0;
-
-	new_nfds = (nfds_t)(shift + slave_idx + 1 + 1);
-	if (new_nfds > READ_ONCE(slave->poll_nfds))
-		WRITE_ONCE(slave->poll_nfds, new_nfds);
-
-	client->fd = -2;
-	return -ECONNRESET;
-}
-
-static int gwk_server_assign_conn_back(struct gwk_server_ctx *ctx,
-				       struct gwk_client_entry *client)
-{
-	struct pkt_slave_conn *conn = &client->pkt.slave_conn;
-	struct gwk_client_entry *client_master;
-	struct gwk_slave_entry *slave;
-	uint32_t client_idx;
-	uint32_t slave_idx;
-	int ret;
-
-	client_idx = ntohl(conn->client_idx);
-	if (client_idx >= ctx->cfg.max_clients) {
-		fprintf(stderr, "Invalid client index: %u\n", client_idx);
-		return -EINVAL;
-	}
-
-	client_master = &ctx->clients[client_idx];
-	if (client_master->fd < 0)
-		return -EOWNERDEAD;
-
-	slave = &client_master->slave;
-	pthread_mutex_lock(&slave->lock);
-	slave_idx = ntohl(conn->slave_idx);
-	if (slave_idx >= slave->allocated) {
-		pthread_mutex_unlock(&slave->lock);
-		fprintf(stderr, "Invalid slave index: %u\n", slave_idx);
-		return -EINVAL;
-	}
-	ret = _gwk_server_assign_conn_back(client, slave, slave_idx, conn);
-	pthread_mutex_unlock(&slave->lock);
-
-	if (ret == -ECONNRESET)
-		pthread_kill(client_master->eph_thread, SIGUSR1);
-
-	return ret;
-}
-
-static int gwk_server_handle_client_slave_conn_back(struct gwk_server_ctx *ctx,
-						    struct gwk_client_entry *client)
-{
-	struct pkt *pkt = &client->pkt;
-
-	if (!validate_pkt_client_slave_conn_back(pkt, client->pkt_len)) {
-		fprintf(stderr, "Invalid client_slave_conn_back packet\n");
-		return -EBADMSG;
-	}
-
-	return gwk_server_assign_conn_back(ctx, client);
-}
-
-static int gwk_server_handle_pkt(struct gwk_server_ctx *ctx,
-				 struct gwk_client_entry *client)
-{
-	struct pkt *pkt = &client->pkt;
+	struct pkt *pkt = &client->rpkt;
 
 	switch (pkt->hdr.type) {
 	case PKT_TYPE_HANDSHAKE:
 		return gwk_server_handle_handshake(ctx, client);
-	case PKT_TYPE_RESERVE_EPHEMERAL_PORT:
-		return gwk_server_handle_reserve_ephemeral_port(ctx, client);
-	case PKT_TYPE_CLIENT_IS_READY:
-		return gwk_server_handle_client_is_ready(ctx, client);
-	case PKT_TYPE_CLIENT_SLAVE_CONN_BACK:
-		return gwk_server_handle_client_slave_conn_back(ctx, client);
 	default:
-		fprintf(stderr, "Unknown packet type: %u\n", pkt->hdr.type);
 		return -EBADMSG;
 	}
 }
 
-static int _gwk_server_handle_client(struct gwk_server_ctx *ctx,
-				     struct gwk_client_entry *client)
+static int gwk_server_handle_client_read(struct gwk_server_ctx *ctx,
+					 struct gwk_client_entry *client)
 {
-	struct pkt *pkt = &client->pkt;
+	struct pkt *pkt = &client->rpkt;
 	size_t expected_len;
 	ssize_t ret;
 	size_t len;
 	char *buf;
 
-	buf = (char *)pkt + client->pkt_len;
-	len = sizeof(*pkt) - client->pkt_len;
+	buf = (char *)pkt + client->rpkt_len;
+	len = sizeof(*pkt) - client->rpkt_len;
 	ret = recv(client->fd, buf, len, 0);
 	if (ret <= 0) {
 		if (!ret)
-			goto out_close;
+			return -EIO;
 
-		ret = errno;
-		if (ret == EAGAIN || ret == EINTR)
+		ret = -errno;
+		if (ret == -EAGAIN)
 			return 0;
 
 		perror("recv");
-		goto out_close;
+		return ret;
 	}
 
-	client->pkt_len += (size_t)ret;
-
-	/*
-	 * Ahh, fuck, short recv?!
-	 */
-	if (client->pkt_len < PKT_HDR_SIZE)
+	client->rpkt_len += (size_t)ret;
+	if (client->rpkt_len < PKT_HDR_SIZE) {
+		/*
+		 * Ahh, fuck, short recv?!
+		 */
 		return 0;
+	}
 
 	expected_len = PKT_HDR_SIZE + ntohs(pkt->hdr.len);
 	if (expected_len > sizeof(*pkt)) {
@@ -1886,186 +1297,137 @@ static int _gwk_server_handle_client(struct gwk_server_ctx *ctx,
 		 * No sane client will send such a long packet.
 		 */
 		fprintf(stderr, "Too long packet: %zu\n", expected_len);
-		goto out_close;
+		return -EBADMSG;
 	}
 
-	if (client->pkt_len < expected_len)
+	if (client->rpkt_len < expected_len)
 		return 0;
 
-	ret = gwk_server_handle_pkt(ctx, client);
-	if (ret < 0)
-		goto out_close;
-
-	client->pkt_len = 0;
-	return 0;
-
-out_close:
-	gwk_server_close_client(ctx, client);
-	return 0;
+	return gwk_server_handle_packet(ctx, client);
 }
 
 static int gwk_server_handle_client(struct gwk_server_ctx *ctx,
-				    struct pollfd *pfd, int64_t idx)
+				    struct pollfd *pfd, uint32_t idx)
 {
 	struct gwk_client_entry *client = &ctx->clients[idx];
+	short revents = pfd->revents;
 
-	/*
-	 * The client socket may be closed by gwk_server_close_client()
-	 * before we get here.
-	 */
-	if (pfd->fd < 0)
-		return -EAGAIN;
+	if (revents & (POLLERR | POLLHUP | POLLNVAL))
+		goto out_close;
 
-	if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
-		fprintf(stderr, "Error on polling the client socket\n");
-		return -EIO;
+	if (revents & POLLIN) {
+		if (gwk_server_handle_client_read(ctx, client))
+			goto out_close;
 	}
 
-	if (!(pfd->revents & POLLIN))
-		return -EAGAIN;
+	return 0;
 
-	return _gwk_server_handle_client(ctx, client);
+out_close:
+	gwk_server_close_client(ctx, &ctx->clients[idx]);
+	return 0;
+}
+
+static int _gwk_server_poll(struct gwk_server_ctx *ctx, uint32_t nr_events)
+{
+	struct gwk_pollfds *pfds = ctx->pollfds;
+	struct pollfd *fds = pfds->fds;
+	nfds_t i, nfds = pfds->nfds;
+	int ret = 0;
+
+	for (i = 0; i < nfds; i++) {
+		struct pollfd *fd = &fds[i];
+
+		if (!nr_events)
+			break;
+
+		if (!fd->revents)
+			continue;
+
+		if (i == 0)
+			ret = gwk_server_handle_accept(ctx, fd);
+		else
+			ret = gwk_server_handle_client(ctx, fd, (uint32_t)i - 1u);
+
+		nr_events--;
+		if (ret)
+			break;
+	}
+
+	return ret;
 }
 
 static int gwk_server_poll(struct gwk_server_ctx *ctx)
 {
-	struct pollfd *poll_fds = ctx->poll_fds;
-	nfds_t cur_nfds;
-	int nr_events;
-	nfds_t i;
+	struct gwk_pollfds *pfds = ctx->pollfds;
+	struct pollfd *fds = pfds->fds;
+	nfds_t nfds = pfds->nfds;
 	int ret;
 
-	/*
-	 * gwk_server_handle_accept() may increase the number of poll fds,
-	 * so we need to save the current number of fds.
-	 */
-	cur_nfds = ctx->poll_nfds;
-	ret = poll(poll_fds, cur_nfds, -1);
-	if (ret < 0) {
-		ret = -errno;
-		perror("poll");
-		return ret;
-	}
-	nr_events = ret;
-
-	ret = gwk_server_handle_accept(ctx, &poll_fds[0]);
-	if (!ret)
-		nr_events--;
-	else if (ret != -EAGAIN)
-		return ret;
-
-	for (i = 1; i < cur_nfds; i++) {
-		if (!nr_events)
-			break;
-
-		ret = gwk_server_handle_client(ctx, &poll_fds[i], i - 1);
+	ret = poll(fds, nfds, 3000);
+	if (ret <= 0) {
 		if (!ret)
-			nr_events--;
-		else if (ret != -EAGAIN)
-			return ret;
+			return 0;
+
+		ret = -errno;
+		if (ret == -EINTR)
+			return 0;
+
+		perror("poll");
+		return -errno;
 	}
 
-	return 0;
+	return _gwk_server_poll(ctx, (uint32_t)ret);
 }
 
 static int gwk_server_run_event_loop(struct gwk_server_ctx *ctx)
 {
+	struct gwk_pollfds *pfds = ctx->pollfds;
 	int ret;
+
+	pfds->fds[0].fd = ctx->tcp_fd;
+	pfds->fds[0].events = POLLIN;
+	pfds->fds[0].revents = 0;
+	pfds->nfds = 1;
 
 	while (!ctx->stop) {
 		ret = gwk_server_poll(ctx);
-		if (ret < 0)
+		if (ret)
 			break;
 	}
 
 	return 0;
 }
 
-static void gwk_server_destroy_clients(struct gwk_server_ctx *ctx)
+static void gwk_server_destroy_client_entries(struct gwk_server_ctx *ctx)
 {
-	struct gwk_client_entry *clients = ctx->clients;
 	uint32_t i;
 
-	if (!clients)
+	if (!ctx->clients)
 		return;
 
 	for (i = 0; i < ctx->cfg.max_clients; i++) {
-		struct gwk_client_entry *c = &clients[i];
+		struct gwk_client_entry *client = &ctx->clients[i];
 
-		c->stop = true;
-		if (c->need_join) {
-			c->being_waited = true;
-			pthread_kill(c->eph_thread, SIGTERM);
-		}
+		if (!client->used)
+			continue;
 
-		if (c->fd >= 0) {
-			close(c->fd);
-			c->fd = -1;
-		}
-		if (c->eph_fd >= 0) {
-			close(c->eph_fd);
-			c->eph_fd = -1;
-		}
-		if (c->need_join) {
-			pthread_join(c->eph_thread, NULL);
-			c->need_join = false;
-		}
+		gwk_server_put_client_entry(ctx, client);
 	}
 
-	destroy_free_slot(&ctx->clients_fs);
-	free(clients);
+	destroy_free_slot(&ctx->client_fs);
+	free(ctx->clients);
 	ctx->clients = NULL;
 }
 
 static void gwk_server_destroy(struct gwk_server_ctx *ctx)
 {
-	gwk_server_destroy_clients(ctx);
+	gwk_server_destroy_client_entries(ctx);
 
-	if (ctx->tcp_fd >= 0) {
+	if (ctx->pollfds)
+		free_gwk_pollfds(ctx->pollfds);
+
+	if (ctx->tcp_fd >= 0)
 		close(ctx->tcp_fd);
-		ctx->tcp_fd = -1;
-	}
-
-	if (ctx->poll_fds) {
-		free(ctx->poll_fds);
-		ctx->poll_fds = NULL;
-	}
-}
-
-static int server_main(int argc, char *argv[])
-{
-	struct gwk_server_ctx ctx;
-	int ret;
-
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.app = argv[0];
-	gwk_server_set_default_values(&ctx);
-	ret = gwk_server_parse_args(argc, argv, &ctx);
-	if (ret)
-		return ret;
-	ret = gwk_server_validate_configs(&ctx);
-	if (ret)
-		return ret;
-	ret = gwk_server_install_signal_handlers(&ctx);
-	if (ret)
-		return ret;
-	ret = gwk_server_init_client_entries(&ctx);
-	if (ret)
-		return ret;
-	ret = gwk_server_init_socket(&ctx);
-	if (ret)
-		goto out;
-	ret = gwk_server_init_pollfds(&ctx);
-	if (ret)
-		goto out;
-
-	ret = gwk_server_run_event_loop(&ctx);
-out:
-	if (ret < 0)
-		fprintf(stderr, "Error: %s\n", strerror(-ret));
-
-	gwk_server_destroy(&ctx);
-	return ret;
 }
 
 static int gwk_client_validate_configs(struct gwk_client_ctx *ctx)
@@ -2161,31 +1523,38 @@ out_err:
 
 static int gwk_client_init_slave_buffers(struct gwk_client_ctx *ctx)
 {
-	struct gwk_slave_buffer *bufs;
+	int ret;
 
-	bufs = calloc(ctx->cfg.max_clients * 2, sizeof(*bufs));
-	if (!bufs)
+	ctx->slaves = alloc_slave_entries(ctx->cfg.max_clients);
+	if (!ctx->slaves)
 		return -ENOMEM;
 
-	ctx->slave_bufs = bufs;
+	/*
+	 * @ctx->ctx->slave_fs only needs to be destroyed when
+	 * @ctx->ctx->slaves is not NULL.
+	 */
+	ret = init_free_slot(&ctx->slave_fs, ctx->cfg.max_clients);
+	if (ret) {
+		free_slave_entries(ctx->slaves, ctx->cfg.max_clients);
+		ctx->slaves = NULL;
+		return ret;
+	}
+
 	return 0;
 }
 
 static int gwk_client_init_pollfds(struct gwk_client_ctx *ctx)
 {
-	struct pollfd *poll_fds;
-	size_t nr, i;
+	uint32_t nr_fds;
 
-	nr = (1u + ctx->cfg.max_clients) * 2u;
-	poll_fds = calloc(nr, sizeof(*poll_fds));
-	if (!poll_fds)
+	/*
+	 * +1 for the main TCP socket that accepts new connections.
+	 */
+	nr_fds = (ctx->cfg.max_clients + 1u) * 2u;
+	ctx->pollfds = alloc_gwk_pollfds(nr_fds);
+	if (!ctx->pollfds)
 		return -ENOMEM;
 
-	for (i = 0; i < nr; i++)
-		poll_fds[i].fd = -1;
-
-	ctx->poll_fds = poll_fds;
-	ctx->poll_nfds = 0;
 	return 0;
 }
 
@@ -2282,7 +1651,7 @@ static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 {
 	struct sockaddr_storage addr;
 	struct pkt *pkt = &ctx->pkt;
-	struct pkt_eph_addr *eph;
+	struct pkt_addr *eph;
 	ssize_t ret;
 	size_t len;
 
@@ -2318,20 +1687,20 @@ static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 		return -EBADMSG;
 	}
 
-	eph = &pkt->eph_addr;
+	eph = &pkt->eph_addr_data;
 	memset(&addr, 0, sizeof(addr));
-	if (eph->type == 4) {
+	if (eph->family == 4) {
 		struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
 
 		sin->sin_family = AF_INET;
 		sin->sin_port = eph->port;
-		memcpy(&sin->sin_addr, &eph->addr4, sizeof(sin->sin_addr));
+		memcpy(&sin->sin_addr, &eph->v4, sizeof(sin->sin_addr));
 	} else {
 		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr;
 
 		sin6->sin6_family = AF_INET6;
 		sin6->sin6_port = eph->port;
-		memcpy(&sin6->sin6_addr, &eph->addr6, sizeof(sin6->sin6_addr));
+		memcpy(&sin6->sin6_addr, &eph->v6, sizeof(sin6->sin6_addr));
 	}
 
 	printf("Ephemeral port reservation succeeded!\n");
@@ -2393,233 +1762,37 @@ static int gwk_client_wait_for_ack_signal(struct gwk_client_ctx *ctx)
 	return 0;
 }
 
-static int create_slave_sock_pair(int fds[2],
-				  struct sockaddr_storage *target_addr,
-				  struct sockaddr_storage *slave_addr,
-				  struct sockaddr_storage *server_addr,
-				  uint32_t client_idx, uint32_t slave_idx)
+static int _gwk_client_poll(struct gwk_client_ctx *ctx, uint32_t nr_events)
 {
-	struct pkt pkt;
-	int target_fd;
-	int server_fd;
-	ssize_t ret;
-	size_t len;
-	int err = 0;
+	struct gwk_pollfds *pollfds = ctx->pollfds;
+	struct pollfd *fds = pollfds->fds;
+	nfds_t i, nfds = pollfds->nfds;
 
-	target_fd = create_sock_and_connect(target_addr);
-	if (target_fd < 0)
-		return target_fd;
+	for (i = 0; i < nfds; i++) {
+		struct pollfd *fd = &fds[i];
 
-	server_fd = create_sock_and_connect(server_addr);
-	if (server_fd < 0) {
-		err = server_fd;
-		goto out_close_target;
-	}
+		if (!nr_events)
+			break;
 
-	len = prep_pkt_client_slave_conn_back(&pkt, client_idx, slave_idx,
-					      slave_addr);
-	ret = send(server_fd, &pkt, len, MSG_WAITALL);
-	if (ret < 0) {
-		ret = -errno;
-		perror("send");
-		goto out_close_server;
-	}
-
-	if ((size_t)ret < len) {
-		fprintf(stderr, "Error: Got short send()\n");
-		err = -EIO;
-		goto out_close_server;
-	}
-
-	fds[0] = target_fd;
-	fds[1] = server_fd;
-	return 0;
-
-out_close_server:
-	close(server_fd);
-out_close_target:
-	close(target_fd);
-	return err;
-}
-
-static int gwk_client_assign_slave_conn(struct gwk_client_ctx *ctx,
-					int target_fd, int server_fd)
-{
-	uint32_t shift = ctx->cfg.max_clients + 1;
-	struct pollfd *pfds = ctx->poll_fds;
-	nfds_t new_nfds;
-	uint32_t i;
-
-	for (i = 1; i < shift; i++) {
-		if (pfds[i].fd != -1)
+		if (!fd->revents)
 			continue;
-
-		assert(pfds[shift + i].fd == -1);
-
-		pfds[i].fd = target_fd;
-		pfds[i].events = POLLIN;
-		pfds[i].revents = 0;
-		pfds[shift + i].fd = server_fd;
-		pfds[shift + i].events = POLLIN;
-		pfds[shift + i].revents = 0;
-
-		new_nfds = (nfds_t)(shift + i + 1);
-		if (new_nfds > ctx->poll_nfds)
-			ctx->poll_nfds = new_nfds;
-
-		return 0;
 	}
-
-	printf("Error: No more slave connection slot available\n");
-	close(target_fd);
-	close(server_fd);
-	return 0;
-}
-
-static int gwk_client_handle_pkt_slave_conn(struct gwk_client_ctx *ctx)
-{
-	struct pkt_slave_conn *sc = &ctx->pkt_r.slave_conn;
-	struct pkt *pkt = &ctx->pkt_r;
-	struct sockaddr_storage addr;
-	int fds[2] = {-1, -1};
-	int ret;
-
-	if (!validate_pkt_server_slave_conn(pkt, ctx->pkt_rlen)) {
-		fprintf(stderr, "Error: Invalid slave connection packet\n");
-		return -EBADMSG;
-	}
-
-	slave_conn_to_sockaddr(sc, &addr);
-	printf("Accepted a slave connection from %s:%hu\n", sa_addr(&addr),
-	       sa_port(&addr));
-
-	ret = create_slave_sock_pair(fds, &ctx->target_addr, &addr,
-				     &ctx->server_addr, ntohl(sc->client_idx),
-				     ntohl(sc->slave_idx));
-	if (ret < 0) {
-		fprintf(stderr, "Error: Failed to create a slave socket pair\n");
-		return 0;
-	}
-
-	assert(fds[0] != -1);
-	assert(fds[1] != -1);
-	return gwk_client_assign_slave_conn(ctx, fds[0], fds[1]);
-}
-
-static void gwk_client_adjust_pkt_rlen(struct gwk_client_ctx *ctx,
-				       size_t eaten_size)
-{
-	struct pkt *pkt = &ctx->pkt_r;
-	size_t len = ctx->pkt_rlen;
-	char *dst, *src;
-	size_t cpy_len;
-
-	if (len <= eaten_size) {
-		ctx->pkt_rlen = 0;
-		return;
-	}
-
-	dst = (char *)pkt;
-	src = dst + eaten_size;
-	cpy_len = len - eaten_size;
-	memmove(dst, src, cpy_len);
-	ctx->pkt_rlen = cpy_len;
-}
-
-static int gwk_client_handle_pkt(struct gwk_client_ctx *ctx)
-{
-	size_t eaten_size = PKT_HDR_SIZE;
-	struct pkt *pkt = &ctx->pkt_r;
-	int ret;
-
-	switch (pkt->hdr.type) {
-	case PKT_TYPE_SERVER_SLAVE_CONN:
-		ret = gwk_client_handle_pkt_slave_conn(ctx);
-		eaten_size += sizeof(pkt->slave_conn);
-		break;
-	default:
-		fprintf(stderr, "Error: Unexpected packet type %u\n",
-			pkt->hdr.type);
-		return -EBADMSG;
-	}
-
-	gwk_client_adjust_pkt_rlen(ctx, eaten_size);
-	return ret;
-}
-
-static int gwk_client_recv(struct gwk_client_ctx *ctx)
-{
-	struct pkt *pkt = &ctx->pkt_r;
-	size_t expected_len;
-	ssize_t ret;
-	size_t len;
-	char *buf;
-
-	buf = (char *)pkt + ctx->pkt_rlen;
-	len = sizeof(*pkt) - ctx->pkt_rlen;
-	ret = recv(ctx->tcp_fd, buf, len, 0);
-	if (ret <= 0) {
-		if (!ret) {
-			ret = -ECONNRESET;
-			goto out_err;
-		}
-
-		ret = -errno;
-		if (ret == -EAGAIN || ret == -EINTR)
-			return 0;
-
-		perror("recv");
-		goto out_err;
-	}
-
-	ctx->pkt_rlen += (size_t)ret;
-
-eat_more:
-	/*
-	 * Ahh, fuck, short recv?!
-	 */
-	if (ctx->pkt_rlen < PKT_HDR_SIZE)
-		return 0;
-
-	expected_len = PKT_HDR_SIZE + ntohs(pkt->hdr.len);
-	if (expected_len > sizeof(*pkt)) {
-		/*
-		 * Sabotage attempt? Not that easy!
-		 * No sane server will send such a long packet.
-		 */
-		fprintf(stderr, "Too long packet: %zu\n", expected_len);
-		ret = -EBADMSG;
-		goto out_err;
-	}
-
-	if (ctx->pkt_rlen < expected_len)
-		return 0;
-
-	ret = gwk_client_handle_pkt(ctx);
-	if (ret)
-		goto out_err;
-
-	/*
-	 * Got multiple packets at once in a single recv()?
-	 */
-	if (ctx->pkt_rlen > 0)
-		goto eat_more;
 
 	return 0;
-
-out_err:
-	return ret;
 }
 
 static int gwk_client_poll(struct gwk_client_ctx *ctx)
 {
-	struct pollfd *fds = ctx->poll_fds;
-	nfds_t i, nfds = ctx->poll_nfds;
-	int nr_events;
+	struct gwk_pollfds *pollfds = ctx->pollfds;
+	struct pollfd *fds = pollfds->fds;
+	nfds_t nfds = pollfds->nfds;
 	int ret;
 
-	ret = poll(fds, nfds, -1);
-	if (ret < 0) {
+	ret = poll(fds, nfds, 3000);
+	if (ret <= 0) {
+		if (!ret)
+			return 0;
+
 		ret = -errno;
 		if (ret == -EINTR)
 			return 0;
@@ -2627,36 +1800,19 @@ static int gwk_client_poll(struct gwk_client_ctx *ctx)
 		perror("poll");
 		return ret;
 	}
-	nr_events = ret;
 
-	if (!nr_events)
-		return 0;
-
-	if (fds[0].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
-		nr_events--;
-		ret = gwk_client_recv(ctx);
-		if (ret)
-			return ret;
-	}
-
-	for (i = 0; i < nfds && nr_events; i++) {
-		if (!fds[i].revents)
-			continue;
-
-		nr_events--;
-	}
-
-	return 0;
+	return _gwk_client_poll(ctx, (uint32_t)ret);
 }
 
 static int gwk_client_run_event_loop(struct gwk_client_ctx *ctx)
 {
+	struct gwk_pollfds *pollfds = ctx->pollfds;
 	int ret = 0;
 
-	ctx->poll_fds[0].fd = ctx->tcp_fd;
-	ctx->poll_fds[0].events = POLLIN;
-	ctx->poll_fds[0].revents = 0;
-	ctx->poll_nfds = 1;
+	pollfds->fds[0].fd = ctx->tcp_fd;
+	pollfds->fds[0].events = POLLIN;
+	pollfds->fds[0].revents = 0;
+	pollfds->nfds = 1;
 
 	printf("Waiting for connection requests...\n");
 	while (!ctx->stop) {
@@ -2670,18 +1826,52 @@ static int gwk_client_run_event_loop(struct gwk_client_ctx *ctx)
 
 static void gwk_client_destroy(struct gwk_client_ctx *ctx)
 {
+	struct gwk_client_cfg *cfg = &ctx->cfg;
+
 	if (ctx->tcp_fd >= 0)
 		close(ctx->tcp_fd);
 
-	if (ctx->poll_fds) {
-		free(ctx->poll_fds);
-		ctx->poll_fds = NULL;
+	if (ctx->slaves) {
+		free_slave_entries(ctx->slaves, cfg->max_clients);
+		destroy_free_slot(&ctx->slave_fs);
 	}
 
-	if (ctx->slave_bufs) {
-		free(ctx->slave_bufs);
-		ctx->slave_bufs = NULL;
-	}
+	if (ctx->pollfds)
+		free_gwk_pollfds(ctx->pollfds);
+}
+
+static int server_main(int argc, char *argv[])
+{
+	struct gwk_server_ctx ctx;
+	int ret;
+
+	gwk_server_ctx_init(&ctx, argv[0]);
+	ret = gwk_server_parse_args(argc, argv, &ctx);
+	if (ret)
+		return ret;
+	ret = gwk_server_validate_configs(&ctx);
+	if (ret)
+		return ret;
+	ret = gwk_server_install_signal_handlers(&ctx);
+	if (ret)
+		return ret;
+	ret = gwk_server_init_client_entries(&ctx);
+	if (ret)
+		return ret;
+	ret = gwk_server_init_socket(&ctx);
+	if (ret)
+		goto out;
+	ret = gwk_server_init_pollfds(&ctx);
+	if (ret)
+		goto out;
+
+	ret = gwk_server_run_event_loop(&ctx);
+out:
+	if (ret < 0)
+		fprintf(stderr, "Error: %s\n", strerror(-ret));
+
+	gwk_server_destroy(&ctx);
+	return 0;
 }
 
 static int client_main(int argc, char *argv[])
@@ -2689,9 +1879,7 @@ static int client_main(int argc, char *argv[])
 	struct gwk_client_ctx ctx;
 	int ret;
 
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.app = argv[0];
-	gwk_client_set_default_values(&ctx);
+	gwk_client_ctx_init(&ctx, argv[0]);
 	ret = gwk_client_parse_args(argc, argv, &ctx);
 	if (ret)
 		return ret;
