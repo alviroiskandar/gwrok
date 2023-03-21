@@ -1332,23 +1332,27 @@ static int _gwk_server_poll(struct gwk_server_ctx *ctx, uint32_t nr_events)
 	struct gwk_pollfds *pfds = ctx->pollfds;
 	struct pollfd *fds = pfds->fds;
 	nfds_t i, nfds = pfds->nfds;
+	struct pollfd *fd;
 	int ret = 0;
 
-	for (i = 0; i < nfds; i++) {
-		struct pollfd *fd = &fds[i];
+	fd = &fds[0];
+	if (fd->revents) {
+		nr_events--;
+		ret = gwk_server_handle_accept(ctx, fd);
+		if (ret)
+			return ret;
+	}
 
+	for (i = 1; i < nfds; i++) {
 		if (!nr_events)
 			break;
 
+		fd = &fds[i];
 		if (!fd->revents)
 			continue;
 
-		if (i == 0)
-			ret = gwk_server_handle_accept(ctx, fd);
-		else
-			ret = gwk_server_handle_client(ctx, fd, (uint32_t)i - 1u);
-
 		nr_events--;
+		ret = gwk_server_handle_client(ctx, fd, (uint32_t)i - 1u);
 		if (ret)
 			break;
 	}
