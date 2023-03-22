@@ -1755,6 +1755,9 @@ static int gwk_slave_pollout_send(int fd, void *buf, size_t *len)
 {
 	ssize_t ret;
 
+	if (!*len)
+		return 0;
+
 	ret = send(fd, buf, *len, MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = -errno;
@@ -1810,7 +1813,6 @@ static int gwk_splice_eph_handle_slave(struct gwk_pollfds *pollfds,
 		return -EIO;
 
 	if (in_pfd->revents & POLLOUT) {
-		assert(*out_buf_len);
 		printf("Handling POLLOUT on %s\n", in_name);
 		ret = gwk_slave_pollout_send(in_fd, out_buf, out_buf_len);
 		if (ret < 0)
