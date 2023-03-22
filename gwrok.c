@@ -40,8 +40,20 @@
 #define PFDS_IDX_SHIFT	1
 #define NR_EPH_SLAVE_ENTRIES	128
 
-#define READ_ONCE(x)		(*(volatile __typeof__(x) *)&(x))
-#define WRITE_ONCE(x, v)	*(volatile __typeof__(x) *)&(x) = (v)
+#define pr_debug(...)				\
+	do {					\
+		if (g_verbose)			\
+			printf(__VA_ARGS__);	\
+	} while (0)
+
+#define printf_once(...)			\
+	do {					\
+		static bool __done;		\
+		if (!__done) {			\
+			__done = true;		\
+			printf(__VA_ARGS__);	\
+		}				\
+	} while (0)
 
 #ifndef __packed
 #define __packed		__attribute__((__packed__))
@@ -303,12 +315,6 @@ static struct gwk_client_ctx *g_client_ctx;
 static __thread struct gwk_client_entry *g_client_entry;
 static __thread unsigned int sig_magic;
 static bool g_verbose;
-
-#define pr_debug(...)				\
-	do {					\
-		if (g_verbose)			\
-			printf(__VA_ARGS__);	\
-	} while (0)
 
 static void show_usage(const char *app)
 {
@@ -1174,10 +1180,8 @@ static int create_sock_and_bind(struct sockaddr_storage *addr)
 #if defined(TCP_QUICKACK)
 	val = 1;
 	ret = setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &val, sizeof(val));
-	if (ret < 0)
-		perror("setsockopt(TCP_QUICKACK)");
-	else
-		printf("Using TCP_QUICKACK...\n");
+	if (!ret)
+		printf_once("Using TCP_QUICKACK...\n");
 #else
 	(void)val;
 #endif
@@ -2613,10 +2617,8 @@ static int create_sock_and_connect(struct sockaddr_storage *addr)
 #if defined(TCP_QUICKACK)
 	val = 1;
 	ret = setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &val, sizeof(val));
-	if (ret < 0)
-		perror("setsockopt(TCP_QUICKACK)");
-	else
-		printf("Using TCP_QUICKACK...\n");
+	if (!ret)
+		printf_once("Using TCP_QUICKACK...\n");
 #else
 	(void)val;
 #endif
@@ -2753,9 +2755,9 @@ static int gwk_client_reserve_ephemeral_port(struct gwk_client_ctx *ctx)
 		memcpy(&sin6->sin6_addr, &eph->v6, sizeof(sin6->sin6_addr));
 	}
 
-	printf("Ephemeral port reservation succeeded!\n");
-	printf("%s:%hu is now bound to the server network on %s:%hu, excellent!\n",
-	       ctx->cfg.server_addr, ctx->cfg.server_port, sa_addr(&addr),
+	pr_debug("Ephemeral port reservation succeeded!\n");
+	printf("Excellent, %s:%hu is now bound to the server network on %s:%hu\n",
+	       ctx->cfg.target_addr, ctx->cfg.target_port, sa_addr(&addr),
 	       sa_port(&addr));
 
 	return 0;
@@ -2767,7 +2769,7 @@ static int gwk_client_send_ready_signal(struct gwk_client_ctx *ctx)
 	ssize_t ret;
 	size_t len;
 
-	printf("Sending ready signal...\n");
+	pr_debug("Sending ready signal...\n");
 	len = prep_pkt_client_is_ready(pkt);
 	ret = send(ctx->tcp_fd, pkt, len, MSG_WAITALL);
 	if (ret < 0) {
@@ -2781,7 +2783,7 @@ static int gwk_client_send_ready_signal(struct gwk_client_ctx *ctx)
 		return -EIO;
 	}
 
-	printf("Ready signal sent!\n");
+	pr_debug("Ready signal sent!\n");
 	return 0;
 }
 
@@ -2791,7 +2793,7 @@ static int gwk_client_wait_for_ack_signal(struct gwk_client_ctx *ctx)
 	ssize_t ret;
 	size_t len;
 
-	printf("Waiting for ACK signal...\n");
+	pr_debug("Waiting for ACK signal...\n");
 	len = pkt_size(PKT_TYPE_SERVER_ACK);
 	ret = recv(ctx->tcp_fd, pkt, len, MSG_WAITALL);
 	if (ret < 0) {
@@ -2810,7 +2812,7 @@ static int gwk_client_wait_for_ack_signal(struct gwk_client_ctx *ctx)
 		return -EBADMSG;
 	}
 
-	printf("Server ACK signal received!\n");
+	pr_debug("Server ACK signal received!\n");
 	return 0;
 }
 
@@ -3167,7 +3169,7 @@ static int gwk_client_run_event_loop(struct gwk_client_ctx *ctx)
 	pollfds->fds[0].revents = 0;
 	pollfds->nfds = 1;
 
-	printf("Waiting for connection requests...\n");
+	printf("Initialization sequence completed (ready to accept connections)\n");
 	while (!ctx->stop) {
 		ret = gwk_client_poll(ctx);
 		if (ret)
