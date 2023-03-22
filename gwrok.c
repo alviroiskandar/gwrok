@@ -1755,7 +1755,7 @@ static int gwk_server_eph_handle_circuit(struct gwk_client_entry *client,
 	struct pollfd *fds = client->pollfds->fds;
 	short revents = pfd->revents;
 	uint32_t pidx;
-	int ret;
+	ssize_t ret;
 
 	if (revents & (POLLERR | POLLHUP | POLLNVAL))
 		return -EIO;
@@ -1764,7 +1764,7 @@ static int gwk_server_eph_handle_circuit(struct gwk_client_entry *client,
 			 slave->circuit_buf, FORWARD_BUFFER_SIZE,
 			 &slave->circuit_buf_len);
 	if (ret < 0) {
-		fprintf(stderr, "splice to target_fd error: %d\n", ret);
+		fprintf(stderr, "splice to target_fd error: %zd\n", ret);
 		return ret;
 	}
 
@@ -1796,7 +1796,7 @@ static int gwk_server_eph_handle_target(struct gwk_client_entry *client,
 			 slave->target_buf, FORWARD_BUFFER_SIZE,
 			 &slave->target_buf_len);
 	if (ret < 0) {
-		fprintf(stderr, "splice to circuit_fd error: %d\n", ret);
+		fprintf(stderr, "splice to circuit_fd error: %zd\n", ret);
 		return ret;
 	}
 
