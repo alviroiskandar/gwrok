@@ -1778,6 +1778,7 @@ static int gwk_server_eph_handle_circuit(struct gwk_client_entry *client,
 		return 0;
 	}
 
+	printf("got pollout target_fd!!!\n");
 	fds[pidx].events |= POLLOUT;
 	return 0;
 }
@@ -1801,15 +1802,13 @@ static int gwk_server_eph_handle_target(struct gwk_client_entry *client,
 		return ret;
 
 	pidx = slave->idx + PFDS_IDX_SHIFT;
-	if (fds[pidx].fd != slave->circuit_fd) {
-		printf("test: %d %d\n", fds[pidx].fd, slave->circuit_fd);
-	}
 	assert(fds[pidx].fd == slave->circuit_fd);
 	if (!slave->target_buf_len) {
 		fds[pidx].events &= ~POLLOUT;
 		return 0;
 	}
 
+	printf("got pollout circuit_fd!!!\n");
 	fds[pidx].events |= POLLOUT;
 	return 0;
 }
