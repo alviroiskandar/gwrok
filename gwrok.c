@@ -1722,8 +1722,8 @@ static ssize_t gwk_send(int fd, const void *buf, size_t len, int flags)
 	return ret;
 }
 
-static ssize_t gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
-			  size_t *rem_len)
+static int gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
+		      size_t *rem_len)
 {
 	uint8_t *rx_buf;
 	uint8_t *tx_buf;
@@ -1754,67 +1754,92 @@ static ssize_t gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
 	return 0;
 }
 
-static int gwk_server_eph_handle_circuit(struct gwk_client_entry *client,
-					 struct gwk_slave_entry *slave,
-					 struct pollfd *pfd)
+
+static int gwk_slave_pollout_send(int fd, void *buf, size_t *len)
 {
-	struct pollfd *fds = client->pollfds->fds;
-	short revents = pfd->revents;
-	uint32_t pidx;
 	ssize_t ret;
 
-	if (revents & (POLLERR | POLLHUP | POLLNVAL))
-		return -EIO;
-
-	ret = gwk_splice(slave->circuit_fd, slave->target_fd,
-			 slave->circuit_buf, FORWARD_BUFFER_SIZE,
-			 &slave->circuit_buf_len);
+	ret = send(fd, buf, *len, MSG_DONTWAIT);
 	if (ret < 0) {
-		fprintf(stderr, "splice to target_fd error: %zd\n", ret);
+		ret = -errno;
+		if (ret == -EAGAIN)
+			return 0;
+
+		perror("send");
 		return ret;
 	}
 
-	pidx = slave->idx + PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES;
-	assert(fds[pidx].fd == slave->target_fd);
-	if (!slave->circuit_buf_len) {
-		fds[pidx].events &= ~POLLOUT;
-		return 0;
-	}
+	*len -= (size_t)ret;
+	if (*len) {
+		char *dst = buf;
 
-	printf("got pollout target_fd!!!\n");
-	fds[pidx].events |= POLLOUT;
+		memmove(dst, dst + ret, *len);
+	}
 	return 0;
 }
 
-static int gwk_server_eph_handle_target(struct gwk_client_entry *client,
-					struct gwk_slave_entry *slave,
-					struct pollfd *pfd)
+static int gwk_splice_eph_handle_slave(struct gwk_pollfds *pollfds,
+				       struct gwk_slave_entry *slave,
+				       struct pollfd *in_pfd, bool is_circuit,
+				       uint32_t rshift)
 {
-	struct pollfd *fds = client->pollfds->fds;
-	short revents = pfd->revents;
-	uint32_t pidx;
-	ssize_t ret;
+	const char *out_name = is_circuit ? "target" : "circuit";
+	const char *in_name = is_circuit ? "circuit" : "target";
+	struct pollfd *out_pfd;
+	int in_fd = in_pfd->fd;
+	size_t *out_buf_len;
+	size_t *in_buf_len;
+	uint8_t *out_buf;
+	uint8_t *in_buf;
+	int out_fd;
+	int ret;
 
-	if (revents & (POLLERR | POLLHUP | POLLNVAL))
+	if (is_circuit) {
+		out_buf = slave->target_buf;
+		out_buf_len = &slave->target_buf_len;
+		in_buf = slave->circuit_buf;
+		in_buf_len = &slave->circuit_buf_len;
+		out_fd = slave->target_fd;
+		out_pfd = &pollfds->fds[slave->idx + PFDS_IDX_SHIFT + rshift];
+	} else {
+		out_buf = slave->circuit_buf;
+		out_buf_len = &slave->circuit_buf_len;
+		in_buf = slave->target_buf;
+		in_buf_len = &slave->target_buf_len;
+		out_fd = slave->circuit_fd;
+		out_pfd = &pollfds->fds[slave->idx + PFDS_IDX_SHIFT];
+	}
+
+	if (in_pfd->revents & (POLLERR | POLLHUP | POLLNVAL))
 		return -EIO;
 
-	ret = gwk_splice(slave->target_fd, slave->circuit_fd,
-			 slave->target_buf, FORWARD_BUFFER_SIZE,
-			 &slave->target_buf_len);
-	if (ret < 0) {
-		fprintf(stderr, "splice to circuit_fd error: %zd\n", ret);
-		return ret;
+	if (in_pfd->revents & POLLOUT) {
+		assert(*out_buf_len);
+		printf("Handling POLLOUT on %s\n", in_name);
+		ret = gwk_slave_pollout_send(in_fd, out_buf, out_buf_len);
+		if (ret < 0)
+			return ret;
+
+		if (!*out_buf_len) {
+			printf("Removing POLLOUT on %s\n", in_name);
+			in_pfd->events &= ~POLLOUT;
+			out_pfd->events |= POLLIN;
+		}
 	}
 
-	pidx = slave->idx + PFDS_IDX_SHIFT;
-	assert(fds[pidx].fd == slave->circuit_fd);
-	if (!slave->target_buf_len) {
-		fds[pidx].events &= ~POLLOUT;
-		return 0;
+	if (in_pfd->revents & POLLIN) {
+		ret = gwk_splice(in_fd, out_fd, in_buf, FORWARD_BUFFER_SIZE,
+				 in_buf_len);
+		if (ret < 0)
+			return ret;
+
+		if (*in_buf_len) {
+			printf("Adding POLLOUT on %s\n", out_name);
+			in_pfd->events &= ~POLLIN;
+			out_pfd->events |= POLLOUT;
+		}
 	}
 
-	printf("got pollout circuit_fd!!!\n");
-	fds[pidx].events |= POLLOUT;
 	return 0;
 }
 
@@ -1875,11 +1900,8 @@ static int gwk_server_eph_handle_slave(struct gwk_client_entry *client,
 	slave = &client->slave.entries[sidx];
 	assert(sidx == slave->idx);
 
-	if (is_circuit)
-		ret = gwk_server_eph_handle_circuit(client, slave, pfd);
-	else
-		ret = gwk_server_eph_handle_target(client, slave, pfd);
-
+	ret = gwk_splice_eph_handle_slave(client->pollfds, slave, pfd,
+					  is_circuit, NR_EPH_SLAVE_ENTRIES);
 	if (!ret)
 		return 0;
 
@@ -2980,66 +3002,6 @@ static int gwk_client_recv(struct gwk_client_ctx *ctx, struct pollfd *pfd)
 	return _gwk_client_recv(ctx);
 }
 
-static int gwk_client_eph_handle_circuit(struct gwk_client_ctx *ctx,
-					 struct gwk_slave_entry *slave,
-					 struct pollfd *pfd)
-{
-	struct pollfd *fds = ctx->pollfds->fds;
-	short revents = pfd->revents;
-	uint32_t pidx;
-	int ret;
-
-	if (revents & (POLLERR | POLLHUP | POLLNVAL))
-		return -EIO;
-
-	ret = gwk_splice(slave->circuit_fd, slave->target_fd,
-			 slave->circuit_buf, FORWARD_BUFFER_SIZE,
-			 &slave->circuit_buf_len);
-	if (ret < 0)
-		return ret;
-
-	pidx = slave->idx + PFDS_IDX_SHIFT + ctx->cfg.max_clients;
-	assert(fds[pidx].fd == slave->target_fd);
-	if (!slave->circuit_buf_len) {
-		fds[pidx].events &= ~POLLOUT;
-		return 0;
-	}
-
-	printf("got POLLOUT on target fd %d\n", slave->target_fd);
-	fds[pidx].events |= POLLOUT;
-	return 0;
-}
-
-static int gwk_client_eph_handle_target(struct gwk_client_ctx *ctx,
-					struct gwk_slave_entry *slave,
-					struct pollfd *pfd)
-{
-	struct pollfd *fds = ctx->pollfds->fds;
-	short revents = pfd->revents;
-	uint32_t pidx;
-	ssize_t ret;
-
-	if (revents & (POLLERR | POLLHUP | POLLNVAL))
-		return -EIO;
-
-	ret = gwk_splice(slave->target_fd, slave->circuit_fd,
-			 slave->target_buf, FORWARD_BUFFER_SIZE,
-			 &slave->target_buf_len);
-	if (ret < 0)
-		return ret;
-
-	pidx = slave->idx + PFDS_IDX_SHIFT;
-	assert(fds[pidx].fd == slave->circuit_fd);
-	if (!slave->target_buf_len) {
-		fds[pidx].events &= ~POLLOUT;
-		return 0;
-	}
-
-	printf("got POLLOUT on circuit fd %d\n", slave->circuit_fd);
-	fds[pidx].events |= POLLOUT;
-	return 0;
-}
-
 static void gwk_client_eph_close_slave(struct gwk_client_ctx *ctx,
 				       struct gwk_slave_entry *slave)
 {
@@ -3068,24 +3030,21 @@ static int gwk_client_eph_handle_slave(struct gwk_client_ctx *ctx,
 	struct gwk_slave_entry *slave;
 	uint32_t sidx;
 	bool is_circuit;
-	int ret;
 
-	if (idx < NR_EPH_SLAVE_ENTRIES) {
+	if (idx < ctx->cfg.max_clients) {
 		sidx = idx - PFDS_IDX_SHIFT;
 		is_circuit = true;
+		/* is_target == false */
 	} else {
 		sidx = idx - PFDS_IDX_SHIFT - ctx->cfg.max_clients;
 		is_circuit = false;
+		/* is_target == true */
 	}
 
 	slave = &ctx->slave.entries[sidx];
-
-	if (is_circuit)
-		ret = gwk_client_eph_handle_circuit(ctx, slave, pfd);
-	else
-		ret = gwk_client_eph_handle_target(ctx, slave, pfd);
-
-	if (!ret)
+	assert(slave->idx == sidx);
+	if (!gwk_splice_eph_handle_slave(ctx->pollfds, slave, pfd, is_circuit,
+					 ctx->cfg.max_clients))
 		return 0;
 
 	gwk_client_eph_close_slave(ctx, slave);
