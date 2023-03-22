@@ -302,6 +302,13 @@ static struct gwk_client_ctx *g_client_ctx;
 
 static __thread struct gwk_client_entry *g_client_entry;
 static __thread unsigned int sig_magic;
+static bool g_verbose;
+
+#define pr_debug(...)				\
+	do {					\
+		if (g_verbose)			\
+			printf(__VA_ARGS__);	\
+	} while (0)
 
 static void show_usage(const char *app)
 {
@@ -388,6 +395,7 @@ static int gwk_server_parse_args(int argc, char *argv[],
 			break;
 		case 'v':
 			ctx->cfg.verbose = true;
+			g_verbose = true;
 			break;
 		default:
 			fprintf(stderr, "Invalid option: %s\n", argv[optind - 1]);
@@ -436,6 +444,7 @@ static int gwk_client_parse_args(int argc, char *argv[],
 			break;
 		case 'v':
 			ctx->cfg.verbose = true;
+			g_verbose = true;
 			break;
 		default:
 			fprintf(stderr, "Invalid option: %s\n", argv[optind - 1]);
@@ -1730,7 +1739,7 @@ static ssize_t gwk_send(int fd, const void *buf, size_t len, int flags)
 }
 
 static int gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
-		      size_t *rem_len)
+		      size_t *rem_len, bool skip_send)
 {
 	uint8_t *rx_buf;
 	uint8_t *tx_buf;
@@ -1746,6 +1755,9 @@ static int gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
 		return rx_ret;
 
 	*rem_len += (size_t)rx_ret;
+	if (skip_send)
+		return 0;
+
 	tx_buf = buf;
 	tx_len = *rem_len;
 	tx_ret = gwk_send(fd_out, tx_buf, tx_len, MSG_DONTWAIT);
@@ -1753,6 +1765,10 @@ static int gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
 		return tx_ret;
 
 	if (tx_ret > 0) {
+		/*
+		 * Carefully handle short writes, we have received more data
+		 * than we can send.
+		 */
 		*rem_len -= (size_t)tx_ret;
 		if (*rem_len > 0)
 			memmove(tx_buf, tx_buf + tx_ret, *rem_len);
@@ -1824,39 +1840,39 @@ static int gwk_splice_eph_handle_slave(struct gwk_pollfds *pollfds,
 		return -EIO;
 
 	if (in_pfd->revents & POLLOUT) {
-		printf("Handling POLLOUT on %s\n", in_name);
+		pr_debug("Handling POLLOUT on %s (fd=%d)\n", in_name, in_fd);
 		ret = gwk_slave_pollout_send(in_fd, out_buf, out_buf_len);
 		if (ret < 0)
 			return ret;
 
 		if (!*out_buf_len) {
-			printf("Removing POLLOUT on %s (fd=%d)\n", in_name,
-			       in_fd);
+			pr_debug("Removing POLLOUT on %s (fd=%d)\n", in_name,
+				 in_fd);
 			in_pfd->events &= ~POLLOUT;
 		}
 
 		if (*out_buf_len < FORWARD_BUFFER_SIZE) {
-			printf("Adding POLLIN on %s (fd=%d)\n", out_name,
-			       out_fd);
+			pr_debug("Adding POLLIN on %s (fd=%d)\n", out_name,
+				 out_fd);
 			out_pfd->events |= POLLIN;
 		}
 	}
 
 	if (in_pfd->revents & POLLIN) {
 		ret = gwk_splice(in_fd, out_fd, in_buf, FORWARD_BUFFER_SIZE,
-				 in_buf_len);
+				 in_buf_len, out_pfd->events & POLLOUT);
 		if (ret < 0)
 			return ret;
 
 		if (*in_buf_len) {
-			printf("Adding POLLOUT on %s (fd=%d)\n", out_name,
-			       out_fd);
+			pr_debug("Adding POLLOUT on %s (fd=%d)\n", out_name,
+				 out_fd);
 			out_pfd->events |= POLLOUT;
 		}
 
 		if (*in_buf_len == FORWARD_BUFFER_SIZE) {
-			printf("Removing POLLIN on %s (fd=%d)\n", in_name,
-			       in_fd);
+			pr_debug("Removing POLLIN on %s (fd=%d)\n", in_name,
+				 in_fd);
 			in_pfd->events &= ~POLLIN;
 		}
 	}
