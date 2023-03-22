@@ -1456,7 +1456,6 @@ static int allocate_ephemeral_port(struct sockaddr_storage *addr,
 	int ret;
 	int fd;
 
-	printf("addr = %s:%hu\n", sa_addr(addr), sa_port(addr));
 	fd = create_sock_and_bind(&shared_addr);
 	if (fd < 0)
 		return fd;
