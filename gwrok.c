@@ -1695,8 +1695,10 @@ static ssize_t gwk_recv(int fd, void *buf, size_t len, int flags)
 	if (ret < 0)
 		return -errno;
 
-	if (!ret)
+	if (!ret) {
+		printf("recv = %zu\n", len);
 		ret = -EIO;
+	}
 
 	return ret;
 }
@@ -1712,8 +1714,10 @@ static ssize_t gwk_send(int fd, const void *buf, size_t len, int flags)
 	if (ret < 0)
 		return -errno;
 
-	if (!ret)
+	if (!ret) {
+		printf("send = %zu\n", len);
 		ret = -EIO;
+	}
 
 	return ret;
 }
