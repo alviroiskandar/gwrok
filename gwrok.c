@@ -1654,6 +1654,9 @@ static ssize_t gwk_recv(int fd, void *buf, size_t len, int flags)
 	if (ret < 0)
 		return -errno;
 
+	if (!ret)
+		ret = -EIO;
+
 	return ret;
 }
 
@@ -1667,6 +1670,9 @@ static ssize_t gwk_send(int fd, const void *buf, size_t len, int flags)
 	ret = send(fd, buf, len, flags);
 	if (ret < 0)
 		return -errno;
+
+	if (!ret)
+		ret = -EIO;
 
 	return ret;
 }
@@ -1687,15 +1693,13 @@ static ssize_t gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
 	if (rx_ret < 0 && rx_ret != -EAGAIN)
 		return rx_ret;
 
-	printf("rx_ret = %zd\n", rx_ret);
 	*rem_len += (size_t)rx_ret;
 	tx_buf = buf;
-	tx_len = (size_t)*rem_len;
+	tx_len = *rem_len;
 	tx_ret = gwk_send(fd_out, tx_buf, tx_len, MSG_DONTWAIT);
 	if (tx_ret < 0 && tx_ret != -EAGAIN)
 		return tx_ret;
 
-	printf("tx_ret = %zd\n", tx_ret);
 	*rem_len -= (size_t)tx_ret;
 	if (*rem_len > 0 && tx_ret > 0)
 		memmove(tx_buf, tx_buf + tx_ret, *rem_len);
@@ -1722,7 +1726,11 @@ static int gwk_server_eph_handle_circuit(struct gwk_client_entry *client,
 		return ret;
 
 	pidx = slave->idx + SERVER_PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES;
-	printf("test: %d %d\n", fds[pidx].fd, slave->target_fd);
+	if (fds[pidx].fd != slave->target_fd) {
+		printf("test circuit: %u %d %d\n", pidx,
+			fds[pidx].fd, slave->target_fd);
+	}
+
 	assert(fds[pidx].fd == slave->target_fd);
 	if (!slave->circuit_buf_len) {
 		fds[pidx].events &= ~POLLOUT;
@@ -1752,6 +1760,9 @@ static int gwk_server_eph_handle_target(struct gwk_client_entry *client,
 		return ret;
 
 	pidx = slave->idx + SERVER_PFDS_IDX_SHIFT;
+	if (fds[pidx].fd != slave->circuit_fd) {
+		printf("test: %d %d\n", fds[pidx].fd, slave->circuit_fd);
+	}
 	assert(fds[pidx].fd == slave->circuit_fd);
 	if (!slave->target_buf_len) {
 		fds[pidx].events &= ~POLLOUT;
@@ -1790,16 +1801,20 @@ static int gwk_server_eph_handle_slave(struct gwk_client_entry *client,
 	if (!ret)
 		return 0;
 
+	printf("Closing slave %u\n", sidx);
 	close(slave->circuit_fd);
 	close(slave->target_fd);
 	slave->circuit_fd = -1;
 	slave->target_fd = -1;
+	slave->circuit_buf_len = 0;
+	slave->target_buf_len = 0;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT].fd = -1;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT].events = 0;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT].revents = 0;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES].fd = -1;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES].events = 0;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES].revents = 0;
+	push_free_slot(&client->slave_fs, sidx);
 	return 0;
 }
 
@@ -3017,6 +3032,7 @@ static int gwk_client_eph_handle_slave(struct gwk_client_ctx *ctx,
 	fds[sidx + SERVER_PFDS_IDX_SHIFT + ctx->cfg.max_clients].fd = -1;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT + ctx->cfg.max_clients].events = 0;
 	fds[sidx + SERVER_PFDS_IDX_SHIFT + ctx->cfg.max_clients].revents = 0;
+	push_free_slot(&ctx->slave_fs, slave->idx);
 	return 0;
 }
 
