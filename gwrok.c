@@ -1819,6 +1819,10 @@ static int gwk_splice_eph_handle_slave(struct gwk_pollfds *pollfds,
 		if (!*out_buf_len) {
 			printf("Removing POLLOUT on %s\n", in_name);
 			in_pfd->events &= ~POLLOUT;
+		}
+
+		if (*out_buf_len < FORWARD_BUFFER_SIZE) {
+			printf("Adding POLLIN on %s\n", out_name);
 			out_pfd->events |= POLLIN;
 		}
 	}
@@ -1831,8 +1835,12 @@ static int gwk_splice_eph_handle_slave(struct gwk_pollfds *pollfds,
 
 		if (*in_buf_len) {
 			printf("Adding POLLOUT on %s\n", out_name);
-			in_pfd->events &= ~POLLIN;
 			out_pfd->events |= POLLOUT;
+		}
+
+		if (*in_buf_len == FORWARD_BUFFER_SIZE) {
+			printf("Removing POLLIN on %s\n", in_name);
+			in_pfd->events &= ~POLLIN;
 		}
 	}
 
