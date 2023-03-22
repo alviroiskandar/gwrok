@@ -1745,11 +1745,13 @@ static ssize_t gwk_splice(int fd_in, int fd_out, void *buf, size_t buf_size,
 	if (tx_ret < 0 && tx_ret != -EAGAIN)
 		return tx_ret;
 
-	*rem_len -= (size_t)tx_ret;
-	if (*rem_len > 0 && tx_ret > 0)
-		memmove(tx_buf, tx_buf + tx_ret, *rem_len);
+	if (tx_ret > 0) {
+		*rem_len -= (size_t)tx_ret;
+		if (*rem_len > 0)
+			memmove(tx_buf, tx_buf + tx_ret, *rem_len);
+	}
 
-	return tx_ret;
+	return 0;
 }
 
 static int gwk_server_eph_handle_circuit(struct gwk_client_entry *client,
