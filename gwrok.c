@@ -35,7 +35,7 @@
 #define POLL_FDS_ARRAY_SHIFT	1
 #define HANDSHAKE_MAGIC		"GWROK99"
 #define SIG_MAGIC		0xdeadbeef
-#define FORWARD_BUFFER_SIZE	4096
+#define FORWARD_BUFFER_SIZE	8192
 #define PFDS_IDX_SHIFT	1
 #define NR_EPH_SLAVE_ENTRIES	128
 
@@ -1695,10 +1695,8 @@ static ssize_t gwk_recv(int fd, void *buf, size_t len, int flags)
 	if (ret < 0)
 		return -errno;
 
-	if (!ret) {
-		printf("recv = %zu\n", len);
+	if (!ret)
 		ret = -EIO;
-	}
 
 	return ret;
 }
@@ -1714,10 +1712,8 @@ static ssize_t gwk_send(int fd, const void *buf, size_t len, int flags)
 	if (ret < 0)
 		return -errno;
 
-	if (!ret) {
-		printf("send = %zu\n", len);
+	if (!ret)
 		ret = -EIO;
-	}
 
 	return ret;
 }
