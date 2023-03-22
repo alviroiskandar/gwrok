@@ -3005,6 +3005,7 @@ static int gwk_client_eph_handle_circuit(struct gwk_client_ctx *ctx,
 		return 0;
 	}
 
+	printf("got POLLOUT on target fd %d\n", slave->target_fd);
 	fds[pidx].events |= POLLOUT;
 	return 0;
 }
@@ -3034,6 +3035,7 @@ static int gwk_client_eph_handle_target(struct gwk_client_ctx *ctx,
 		return 0;
 	}
 
+	printf("got POLLOUT on circuit fd %d\n", slave->circuit_fd);
 	fds[pidx].events |= POLLOUT;
 	return 0;
 }
