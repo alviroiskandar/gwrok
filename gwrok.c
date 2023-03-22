@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #define DEFAULT_HOST		"127.0.0.1"
@@ -1162,6 +1163,17 @@ static int create_sock_and_bind(struct sockaddr_storage *addr)
 	(void)val;
 #endif
 
+#if defined(TCP_NODELAY)
+	val = 1;
+	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+	if (ret < 0)
+		perror("setsockopt(TCP_NODELAY)");
+	else
+		printf("Using TCP_NODELAY...\n");
+#else
+	(void)val;
+#endif
+
 	if (addr->ss_family == AF_INET)
 		len = sizeof(struct sockaddr_in);
 	else
@@ -1819,12 +1831,14 @@ static int gwk_splice_eph_handle_slave(struct gwk_pollfds *pollfds,
 			return ret;
 
 		if (!*out_buf_len) {
-			printf("Removing POLLOUT on %s\n", in_name);
+			printf("Removing POLLOUT on %s (fd=%d)\n", in_name,
+			       in_fd);
 			in_pfd->events &= ~POLLOUT;
 		}
 
 		if (*out_buf_len < FORWARD_BUFFER_SIZE) {
-			printf("Adding POLLIN on %s\n", out_name);
+			printf("Adding POLLIN on %s (fd=%d)\n", out_name,
+			       out_fd);
 			out_pfd->events |= POLLIN;
 		}
 	}
@@ -1836,12 +1850,14 @@ static int gwk_splice_eph_handle_slave(struct gwk_pollfds *pollfds,
 			return ret;
 
 		if (*in_buf_len) {
-			printf("Adding POLLOUT on %s\n", out_name);
+			printf("Adding POLLOUT on %s (fd=%d)\n", out_name,
+			       out_fd);
 			out_pfd->events |= POLLOUT;
 		}
 
 		if (*in_buf_len == FORWARD_BUFFER_SIZE) {
-			printf("Removing POLLIN on %s\n", in_name);
+			printf("Removing POLLIN on %s (fd=%d)\n", in_name,
+			       in_fd);
 			in_pfd->events &= ~POLLIN;
 		}
 	}
@@ -2568,6 +2584,7 @@ static int gwk_client_init_pollfds(struct gwk_client_ctx *ctx)
 static int create_sock_and_connect(struct sockaddr_storage *addr)
 {
 	socklen_t len;
+	int val;
 	int ret;
 	int fd;
 
@@ -2577,6 +2594,17 @@ static int create_sock_and_connect(struct sockaddr_storage *addr)
 		perror("socket");
 		return ret;
 	}
+
+#if defined(TCP_NODELAY)
+	val = 1;
+	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+	if (ret < 0)
+		perror("setsockopt(TCP_NODELAY)");
+	else
+		printf("Using TCP_NODELAY...\n");
+#else
+	(void)val;
+#endif
 
 	if (addr->ss_family == AF_INET)
 		len = sizeof(struct sockaddr_in);
