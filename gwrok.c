@@ -1232,7 +1232,7 @@ static void gwk_server_put_client_entry(struct gwk_server_ctx *ctx,
 	client->being_waited = true;
 
 	if (client->need_join) {
-		pthread_kill(client->eph_thread, SIGUSR1);
+		pthread_kill(client->eph_thread, SIGTERM);
 		pthread_join(client->eph_thread, NULL);
 	}
 
