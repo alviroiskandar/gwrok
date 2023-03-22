@@ -1144,7 +1144,7 @@ static int gwk_server_init_client_entries(struct gwk_server_ctx *ctx)
 static int create_sock_and_bind(struct sockaddr_storage *addr)
 {
 	socklen_t len;
-	int val;
+	int val = 1;
 	int ret;
 	int fd;
 
@@ -1156,20 +1156,19 @@ static int create_sock_and_bind(struct sockaddr_storage *addr)
 	}
 
 #if defined(__linux__)
-	val = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
 #else
 	(void)val;
 #endif
 
-#if defined(TCP_NODELAY)
+#if defined(TCP_QUICKACK)
 	val = 1;
-	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+	ret = setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &val, sizeof(val));
 	if (ret < 0)
-		perror("setsockopt(TCP_NODELAY)");
+		perror("setsockopt(TCP_QUICKACK)");
 	else
-		printf("Using TCP_NODELAY...\n");
+		printf("Using TCP_QUICKACK...\n");
 #else
 	(void)val;
 #endif
@@ -2595,13 +2594,13 @@ static int create_sock_and_connect(struct sockaddr_storage *addr)
 		return ret;
 	}
 
-#if defined(TCP_NODELAY)
+#if defined(TCP_QUICKACK)
 	val = 1;
-	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+	ret = setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &val, sizeof(val));
 	if (ret < 0)
-		perror("setsockopt(TCP_NODELAY)");
+		perror("setsockopt(TCP_QUICKACK)");
 	else
-		printf("Using TCP_NODELAY...\n");
+		printf("Using TCP_QUICKACK...\n");
 #else
 	(void)val;
 #endif
