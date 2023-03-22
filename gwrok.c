@@ -30,7 +30,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
-#define DEFAULT_HOST		"127.0.0.1"
+#define DEFAULT_HOST		"188.166.250.196"
 #define DEFAULT_PORT		9777
 #define DEFAULT_MAX_CLIENTS	512
 #define POLL_FDS_ARRAY_SHIFT	1
