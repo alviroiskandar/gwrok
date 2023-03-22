@@ -1477,8 +1477,7 @@ static int gwk_server_handle_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
 	return gwk_server_send_ephemeral_port(ctx, client);
 }
 
-static int gwk_server_init_eph_thread(struct gwk_server_ctx *ctx,
-				      struct gwk_client_entry *client)
+static int gwk_server_init_eph_thread(struct gwk_client_entry *client)
 {
 	int ret;
 
@@ -1641,6 +1640,77 @@ static int gwk_server_eph_accept(struct gwk_server_ctx *ctx,
 	return gwk_server_eph_assign_client(client, ret, &addr);
 }
 
+static int gwk_server_eph_handle_circuit(struct gwk_server_ctx *ctx,
+					 struct gwk_client_entry *client,
+					 struct gwk_slave_entry *slave,
+					 struct pollfd *pfd)
+{
+	short revents = pfd->revents;
+	int ret;
+
+	if (revents & (POLLERR | POLLHUP | POLLNVAL))
+		return -EIO;
+
+	// TODO:
+	return 0;
+}
+
+static int gwk_server_eph_handle_target(struct gwk_server_ctx *ctx,
+					struct gwk_client_entry *client,
+					struct gwk_slave_entry *slave,
+					struct pollfd *pfd)
+{
+	short revents = pfd->revents;
+	int ret;
+
+	if (revents & (POLLERR | POLLHUP | POLLNVAL))
+		return -EIO;
+
+	// TODO:
+	return 0;
+}
+
+static int gwk_server_eph_handle_slave(struct gwk_server_ctx *ctx,
+				       struct gwk_client_entry *client,
+				       struct pollfd *pfd, uint32_t idx)
+{
+	struct pollfd *fds = client->pollfds->fds;
+	struct gwk_slave_entry *slave;
+	uint32_t sidx;
+	bool is_circuit;
+	int ret;
+
+	if (idx < NR_EPH_SLAVE_ENTRIES) {
+		sidx = idx - SERVER_PFDS_IDX_SHIFT;
+		is_circuit = true;
+	} else {
+		sidx = idx - SERVER_PFDS_IDX_SHIFT - NR_EPH_SLAVE_ENTRIES;
+		is_circuit = false;
+	}
+
+	slave = &client->slaves[sidx];
+
+	if (is_circuit)
+		ret = gwk_server_eph_handle_circuit(ctx, client, slave, pfd);
+	else
+		ret = gwk_server_eph_handle_target(ctx, client, slave, pfd);
+
+	if (!ret)
+		return 0;
+
+	close(slave->circuit_fd);
+	close(slave->target_fd);
+	slave->circuit_fd = -1;
+	slave->target_fd = -1;
+	fds[sidx + SERVER_PFDS_IDX_SHIFT].fd = -1;
+	fds[sidx + SERVER_PFDS_IDX_SHIFT].events = 0;
+	fds[sidx + SERVER_PFDS_IDX_SHIFT].revents = 0;
+	fds[sidx + SERVER_PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES].fd = -1;
+	fds[sidx + SERVER_PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES].events = 0;
+	fds[sidx + SERVER_PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES].revents = 0;
+	return 0;
+}
+
 static int _gwk_server_eph_poll(struct gwk_server_ctx *ctx,
 				struct gwk_client_entry *client,
 				uint32_t nr_events)
@@ -1668,10 +1738,9 @@ static int _gwk_server_eph_poll(struct gwk_server_ctx *ctx,
 			continue;
 
 		nr_events--;
-		printf("test i poll = %ld\n", i);
-		// ret = gwk_server_handle_client(ctx, fd, (uint32_t)i - 1u);
-		// if (ret)
-		// 	break;
+		ret = gwk_server_eph_handle_slave(ctx, client, fd, (uint32_t)i);
+		if (ret)
+			break;
 	}
 
 	return ret;
@@ -1709,7 +1778,7 @@ static void *gwk_server_eph_thread(void *data)
 	int ret;
 
 	free(epht);
-	ret = gwk_server_init_eph_thread(ctx, client);
+	ret = gwk_server_init_eph_thread(client);
 	if (ret < 0)
 		goto out;
 
@@ -1784,13 +1853,10 @@ static bool slave_conn_cmp_sockaddr(struct pkt_slave_conn *sc,
 
 		if (s->sin_family != AF_INET)
 			return false;
-		
-		printf("aaaaaaaaaaa\n");
+
 		if (memcmp(&s->sin_addr, &sc->addr.v4, sizeof(s->sin_addr)))
 			return false;
 
-		printf("zzzzzzzzz %hu %hu %hu\n",
-		       s->sin_port, sc->addr.port, htons(sc->addr.port));
 		if (s->sin_port != sc->addr.port)
 			return false;
 	} else {
@@ -2577,6 +2643,7 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 		goto out_terminate;
 	}
 	idx = (uint32_t)ret;
+
 	circuit_fd = create_sock_and_connect(&ctx->server_addr);
 	if (circuit_fd < 0) {
 		fprintf(stderr, "Error: Failed to connect to server %s:%hu\n",
@@ -2584,6 +2651,7 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 		goto out_terminate;
 	}
 
+	slave_conn_to_sockaddr(sc, &addr);
 	ret = gwk_client_send_slave_conn(ctx, circuit_fd, &addr);
 	if (ret < 0) {
 		fprintf(stderr, "Error: Failed to send slave connection\n");
@@ -2598,7 +2666,8 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 	}
 
 	slave = &ctx->slaves[idx];
-	slave_conn_to_sockaddr(sc, &addr);
+	printf("Accepted a slave connection from %s:%hu\n", sa_addr(&addr),
+	       sa_port(&addr));
 	assign_slave(slave, circuit_fd, target_fd, &addr);
 	return 0;
 
@@ -2611,17 +2680,12 @@ out_terminate:
 static int gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 {
 	struct pkt_slave_conn *sc = &ctx->rpkt.slave_conn;
-	struct sockaddr_storage addr;
 	struct pkt *pkt = &ctx->rpkt;
 
 	if (!validate_pkt_server_slave_conn(pkt, ctx->rpkt_len)) {
 		fprintf(stderr, "Error: Invalid slave connection packet\n");
 		return -EBADMSG;
 	}
-
-	slave_conn_to_sockaddr(sc, &addr);
-	printf("Accepted a slave connection from %s:%hu\n", sa_addr(&addr),
-	       sa_port(&addr));
 
 	return _gwk_client_handle_slave_conn(ctx);
 }
