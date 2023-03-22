@@ -1763,15 +1763,12 @@ static int gwk_server_eph_handle_circuit(struct gwk_client_entry *client,
 	ret = gwk_splice(slave->circuit_fd, slave->target_fd,
 			 slave->circuit_buf, FORWARD_BUFFER_SIZE,
 			 &slave->circuit_buf_len);
-	if (ret < 0)
+	if (ret < 0) {
+		fprintf(stderr, "splice to target_fd error: %d\n", ret);
 		return ret;
-
-	pidx = slave->idx + PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES;
-	if (fds[pidx].fd != slave->target_fd) {
-		printf("test circuit: %u %d %d\n", pidx,
-			fds[pidx].fd, slave->target_fd);
 	}
 
+	pidx = slave->idx + PFDS_IDX_SHIFT + NR_EPH_SLAVE_ENTRIES;
 	assert(fds[pidx].fd == slave->target_fd);
 	if (!slave->circuit_buf_len) {
 		fds[pidx].events &= ~POLLOUT;
@@ -1798,8 +1795,10 @@ static int gwk_server_eph_handle_target(struct gwk_client_entry *client,
 	ret = gwk_splice(slave->target_fd, slave->circuit_fd,
 			 slave->target_buf, FORWARD_BUFFER_SIZE,
 			 &slave->target_buf_len);
-	if (ret < 0)
+	if (ret < 0) {
+		fprintf(stderr, "splice to circuit_fd error: %d\n", ret);
 		return ret;
+	}
 
 	pidx = slave->idx + PFDS_IDX_SHIFT;
 	assert(fds[pidx].fd == slave->circuit_fd);
