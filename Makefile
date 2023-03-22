@@ -1,6 +1,6 @@
 
 CC ?= cc
-CLFAGS ?= -Wall -Wextra -g -I/usr/include -I/usr/local/include -L/usr/lib -L/usr/local/lib -O2 -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
+CLFAGS ?= -Wall -Wextra -g -I/usr/include -I/usr/local/include -L/usr/lib -L/usr/local/lib -O2 -fno-omit-frame-pointer
 
 all: gwrok
 
