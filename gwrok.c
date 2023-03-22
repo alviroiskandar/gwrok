@@ -1949,6 +1949,7 @@ static void *gwk_server_eph_thread(void *data)
 	int ret;
 
 	free(epht);
+	g_client_entry = client;
 	ret = gwk_server_init_eph_thread(client);
 	if (ret < 0)
 		goto out;
@@ -2163,11 +2164,20 @@ static int gwk_server_handle_packet(struct gwk_server_ctx *ctx,
 		bytes_eaten += sizeof(pkt->term_slave);
 		break;
 	default:
-		return -EBADMSG;
+		ret = -EBADMSG;
+		break;
 	}
 
+	if (ret)
+		return ret;
+
 	client->rpkt_len -= bytes_eaten;
-	return ret;
+	if (client->rpkt_len) {
+		char *dst = (char *)pkt;
+
+		memmove(dst, dst + bytes_eaten, client->rpkt_len);
+	}
+	return 0;
 }
 
 static int gwk_server_handle_client_read(struct gwk_server_ctx *ctx,
@@ -2195,8 +2205,9 @@ static int gwk_server_handle_client_read(struct gwk_server_ctx *ctx,
 		return ret;
 	}
 
-eat_again:
 	client->rpkt_len += (size_t)ret;
+
+eat_again:
 	if (client->rpkt_len < PKT_HDR_SIZE) {
 		/*
 		 * Ahh, fuck, short recv?!
@@ -2221,16 +2232,8 @@ eat_again:
 	if (err)
 		return err;
 
-	if (client->rpkt_len > expected_len) {
-		/*
-		 * We have more data in the buffer!
-		 */
-		buf = (char *)pkt;
-		len = client->rpkt_len - expected_len;
-		memmove(buf, buf + expected_len, len);
-		client->rpkt_len = len;
+	if (client->rpkt_len)
 		goto eat_again;
-	}
 	
 	return 0;
 }
@@ -2887,12 +2890,22 @@ static int gwk_client_handle_packet(struct gwk_client_ctx *ctx)
 		bytes_eaten += sizeof(pkt->slave_conn);
 		break;
 	default:
+		fprintf(stderr, "Error: Unknown packet type %u\n",
+			pkt->hdr.type);
 		ret = -EBADMSG;
 		break;
 	}
 
+	if (ret)
+		return ret;
+
 	ctx->rpkt_len -= bytes_eaten;
-	return ret;
+	if (ctx->rpkt_len) {
+		char *dst = (char *)pkt;
+
+		memmove(dst, dst + bytes_eaten, ctx->rpkt_len);
+	}
+	return 0;
 }
 
 static int _gwk_client_recv(struct gwk_client_ctx *ctx)
@@ -2919,8 +2932,9 @@ static int _gwk_client_recv(struct gwk_client_ctx *ctx)
 		return ret;
 	}
 
-eat_again:
 	ctx->rpkt_len += (size_t)ret;
+
+eat_again:
 	if (ctx->rpkt_len < PKT_HDR_SIZE) {
 		/*
 		 * Ahh, fuck, short recv?!
@@ -2945,16 +2959,8 @@ eat_again:
 	if (err)
 		return err;
 
-	if (ctx->rpkt_len > expected_len) {
-		/*
-		 * We have more data in the buffer!
-		 */
-		buf = (char *)pkt;
-		len = ctx->rpkt_len - expected_len;
-		memmove(buf, buf + expected_len, len);
-		ctx->rpkt_len = len;
+	if (ctx->rpkt_len)
 		goto eat_again;
-	}
 
 	return 0;
 }
