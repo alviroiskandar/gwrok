@@ -703,32 +703,38 @@ static size_t prep_pkt_reserve_ephemeral_port(struct pkt *pkt)
 	return PKT_HDR_SIZE;
 }
 
-static size_t prep_pkt_ephemeral_addr_data(struct pkt *pkt,
-					   struct sockaddr_storage *addr)
+static void assign_addr_storage_to_pkt_addr(struct pkt_addr *pkt_addr,
+					    struct sockaddr_storage *addr)
 {
 	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
 	struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+
+	/*
+	 * Note that pkt_addr->family is not affected by the host's
+	 * endianness. Because it is only 8 bits in size.
+	 */
+	if (addr->ss_family == AF_INET6) {
+		pkt_addr->family = 6;
+		pkt_addr->v6 = sin6->sin6_addr;
+		pkt_addr->port = sin6->sin6_port;
+	} else {
+		pkt_addr->family = 4;
+		pkt_addr->v4 = sin->sin_addr;
+		pkt_addr->port = sin->sin_port;
+	}
+	pkt_addr->__pad = 0;
+}
+
+static size_t prep_pkt_ephemeral_addr_data(struct pkt *pkt,
+					   struct sockaddr_storage *addr)
+{
 	struct pkt_addr *eph = &pkt->eph_addr_data;
 
 	pkt->hdr.type = PKT_TYPE_EPHEMERAL_ADDR_DATA;
 	pkt->hdr.flags = 0;
 	pkt->hdr.len = htons((uint16_t)sizeof(*eph));
 
-	/*
-	 * Note that eph->type is not affected by the host's
-	 * endianness. Because it is only 8 bits in size.
-	 */
-	if (addr->ss_family == AF_INET6) {
-		eph->family = 6;
-		eph->v6 = sin6->sin6_addr;
-		eph->port = sin6->sin6_port;
-	} else {
-		eph->family = 4;
-		eph->v4 = sin->sin_addr;
-		eph->port = sin->sin_port;
-	}
-	eph->__pad = 0;
-
+	assign_addr_storage_to_pkt_addr(eph, addr);
 	return PKT_HDR_SIZE + sizeof(*eph);
 }
 
@@ -752,8 +758,6 @@ static size_t prep_pkt_server_slave_conn(struct pkt *pkt, uint32_t master_idx,
 					 uint32_t slave_idx,
 					 struct sockaddr_storage *addr)
 {
-	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
-	struct sockaddr_in *sin = (struct sockaddr_in *)addr;
 	struct pkt_slave_conn *conn = &pkt->slave_conn;
 
 	pkt->hdr.type = PKT_TYPE_SERVER_SLAVE_CONN;
@@ -763,21 +767,7 @@ static size_t prep_pkt_server_slave_conn(struct pkt *pkt, uint32_t master_idx,
 	conn->master_idx = htonl(master_idx);
 	conn->slave_idx = htonl(slave_idx);
 
-	/*
-	 * Note that eph->type is not affected by the host's
-	 * endianness. Because it is only 8 bits in size.
-	 */
-	if (addr->ss_family == AF_INET6) {
-		conn->addr.family = 6;
-		conn->addr.v6 = sin6->sin6_addr;
-		conn->addr.port = sin6->sin6_port;
-	} else {
-		conn->addr.family = 4;
-		conn->addr.v4 = sin->sin_addr;
-		conn->addr.port = sin->sin_port;
-	}
-	conn->addr.__pad = 0;
-
+	assign_addr_storage_to_pkt_addr(&conn->addr, addr);
 	return PKT_HDR_SIZE + sizeof(*conn);
 }
 
@@ -786,8 +776,6 @@ static size_t prep_pkt_client_slave_conn_back(struct pkt *pkt,
 					      uint32_t slave_idx,
 					      struct sockaddr_storage *addr)
 {
-	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
-	struct sockaddr_in *sin = (struct sockaddr_in *)addr;
 	struct pkt_slave_conn *conn = &pkt->slave_conn_back;
 
 	pkt->hdr.type = PKT_TYPE_CLIENT_SLAVE_CONN_BACK;
@@ -797,21 +785,7 @@ static size_t prep_pkt_client_slave_conn_back(struct pkt *pkt,
 	conn->master_idx = htonl(master_idx);
 	conn->slave_idx = htonl(slave_idx);
 
-	/*
-	 * Note that eph->type is not affected by the host's
-	 * endianness. Because it is only 8 bits in size.
-	 */
-	if (addr->ss_family == AF_INET6) {
-		conn->addr.family = 6;
-		conn->addr.v6 = sin6->sin6_addr;
-		conn->addr.port = sin6->sin6_port;
-	} else {
-		conn->addr.family = 4;
-		conn->addr.v4 = sin->sin_addr;
-		conn->addr.port = sin->sin_port;
-	}
-	conn->addr.__pad = 0;
-
+	assign_addr_storage_to_pkt_addr(&conn->addr, addr);
 	return PKT_HDR_SIZE + sizeof(*conn);
 }
 
