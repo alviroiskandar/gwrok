@@ -1908,7 +1908,7 @@ static void gwk_server_eph_close_slave(struct gwk_client_entry *client,
 	assert(slave->idx < NR_EPH_SLAVE_ENTRIES);
 
 	pidx = slave->idx + PFDS_IDX_SHIFT;
-	assert(slave->circuit_fd == fds[pidx].fd);
+	assert(slave->circuit_fd != -1);
 	fds[pidx].fd = -1;
 	fds[pidx].events = 0;
 	fds[pidx].revents = 0;
@@ -2197,6 +2197,12 @@ static int gwk_server_handle_client_term_slave(struct gwk_client_entry *client)
 	}
 
 	slave = &client->slave.entries[slave_idx];
+	if (slave->circuit_fd < 0) {
+		fprintf(stderr, "Slave %u is not connected, but trying to be terminated\n",
+			slave_idx);
+		return -EINVAL;
+	}
+
 	gwk_server_eph_close_slave(client, slave);
 	return 0;
 }
