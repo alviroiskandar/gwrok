@@ -1119,7 +1119,7 @@ static int gwk_init_slave_slot(struct gwk_slave_slot *ss, uint32_t nr_entries)
 	return 0;
 }
 
-static uint32_t gwk_slave_pair_refcnt_add(struct gwk_slave_pair *pair)
+static uint32_t gwk_slave_pair_refcnt_inc(struct gwk_slave_pair *pair)
 {
 	return atomic_fetch_add(&pair->refcnt, 1u) + 1u;
 }
@@ -1136,10 +1136,15 @@ static uint32_t gwk_put_slave_pair(struct gwk_slave_slot *ss,
 	a = &pair->a;
 	b = &pair->b;
 
-	if (a->buf)
+	if (a->buf) {
 		free(a->buf);
-	if (b->buf)
+		a->buf = NULL;
+	}
+
+	if (b->buf) {
 		free(b->buf);
+		b->buf = NULL;
+	}
 
 	gwk_close(&a->fd);
 	gwk_close(&b->fd);
@@ -1161,7 +1166,7 @@ static struct gwk_slave_pair *gwk_get_slave_pair(struct gwk_slave_slot *ss)
 		return NULL;
 
 	pair = &ss->entries[idx];
-	refcnt = gwk_slave_pair_refcnt_add(pair);
+	refcnt = gwk_slave_pair_refcnt_inc(pair);
 
 	assert(refcnt == 1u);
 	assert((uint32_t)idx == pair->idx);
@@ -1241,9 +1246,14 @@ out_destroy_mutexes:
 	return -ret;
 }
 
-static uint32_t gwk_client_refcnt_add(struct gwk_client *c)
+static uint32_t gwk_client_refcnt_inc(struct gwk_client *c)
 {
 	return atomic_fetch_add(&c->refcnt, 1u) + 1u;
+}
+
+static uint32_t gwk_client_refcnt_dec(struct gwk_client *c)
+{
+	return atomic_fetch_sub(&c->refcnt, 1u) - 1u;
 }
 
 static struct gwk_client *gwk_get_client(struct gwk_client_slot *cs)
@@ -1257,7 +1267,7 @@ static struct gwk_client *gwk_get_client(struct gwk_client_slot *cs)
 		return NULL;
 
 	c = &cs->entries[idx];
-	refcnt = gwk_client_refcnt_add(c);
+	refcnt = gwk_client_refcnt_inc(c);
 
 	assert(refcnt == 1u);
 	assert((uint32_t)idx == c->idx);
@@ -1266,6 +1276,21 @@ static struct gwk_client *gwk_get_client(struct gwk_client_slot *cs)
 	return c;
 }
 
+static struct gwk_client *gwk_get_client_if_active(struct gwk_client_slot *cs,
+						   uint32_t idx)
+{
+	struct gwk_client *c;
+
+	if (idx >= cs->fs.stack->rbp)
+		return NULL;
+
+	c = &cs->entries[idx];
+	if (gwk_client_refcnt_inc(c) == 1) {
+		gwk_client_refcnt_dec(c);
+		c = NULL;
+	}
+	return c;
+}
 
 static void notify_eph_thread(struct gwk_client *c)
 {
@@ -1344,12 +1369,13 @@ static void __gwk_destroy_client_slot(struct gwk_client *entries, uint32_t n)
 
 static void gwk_destroy_client_slot(struct gwk_client_slot *cs)
 {
-	if (cs->entries) {
-		__gwk_destroy_client_slot(cs->entries, cs->fs.stack->rbp);
-		destroy_free_slot(&cs->fs);
-		free(cs->entries);
-		memset(cs, 0, sizeof(*cs));
-	}
+	if (!cs->entries)
+		return;
+
+	__gwk_destroy_client_slot(cs->entries, cs->fs.stack->rbp);
+	destroy_free_slot(&cs->fs);
+	free(cs->entries);
+	memset(cs, 0, sizeof(*cs));
 }
 
 static int fill_addr_storage(struct sockaddr_storage *addr_storage,
@@ -1591,7 +1617,7 @@ static int gwk_server_assign_client(struct gwk_server_ctx *ctx, int fd,
 		pr_err("poll_add() in assign client: %s\n", strerror(-ret));
 		gwk_put_client(&ctx->client_slot, client);
 		close(fd);
-		return ret;
+		return 0;
 	}
 
 	return 0;
@@ -1625,7 +1651,7 @@ static void gwk_server_close_client(struct gwk_server_ctx *ctx,
 	struct pollfd *pfd;
 	nfds_t idx;
 
-	assert(client->fd >= 0);
+	assert(client->fd >= 0 || client->fd == -2);
 
 	client->stop = true;
 	notify_eph_thread(client);
@@ -1655,7 +1681,6 @@ static int gwk_server_handle_accept(struct gwk_server_ctx *ctx,
 	struct sockaddr_storage addr;
 	socklen_t len;
 	int ret;
-	int err;
 
 	assert(pfd->fd == ctx->tcp_fd);
 	if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -1663,27 +1688,29 @@ static int gwk_server_handle_accept(struct gwk_server_ctx *ctx,
 		return -EIO;
 	}
 
+again:
+	memset(&addr, 0, sizeof(addr));
 	len = sizeof(addr);
 	ret = accept(ctx->tcp_fd, (struct sockaddr *)&addr, &len);
 	if (ret < 0)
 		return accept_err_translate(-errno);
 
-	err = set_nonblock(ret);
-	if (err) {
-		/*
-		 * We don't care if this fails. We can still use the socket
-		 * even if it's blocking. The recv() and send() will use
-		 * MSG_DONTWAIT anyway.
-		 */
-		pr_err("Failed to set nonblock on accepted socket: %s\n",
-		       strerror(-err));
-	}
+	/*
+	 * We don't care if this fails. We can still use the socket
+	 * even if it's blocking. The recv() and send() will use
+	 * MSG_DONTWAIT anyway.
+	 */
+	set_nonblock(ret);
 
 	/*
 	 * gwk_server_assign_client() owns the socket fd. It will close it
 	 * if it fails to assign the client.
 	 */
-	return gwk_server_assign_client(ctx, ret, &addr);
+	ret = gwk_server_assign_client(ctx, ret, &addr);
+	if (ret)
+		return ret;
+
+	goto again;
 }
 
 static ssize_t gwk_rem_recv(int fd, void *buf_p, size_t len, size_t *rem_len)
@@ -1928,30 +1955,6 @@ static int gwk_server_handle_reserve_ephemeral_port(struct gwk_server_ctx *ctx,
 	return gwk_server_send_ephemeral_port(client);
 }
 
-static int gwk_server_send_ack(struct gwk_client *client)
-{
-	struct pkt pkt;
-	ssize_t ret;
-	size_t len;
-
-	len = prep_pkt_server_ack(&pkt);
-	ret = send(client->fd, &pkt, len, MSG_WAITALL);
-	if (ret < 0) {
-		ret = -errno;
-		perror("send");
-		return ret;
-	}
-
-	if ((size_t)ret != len) {
-		pr_err("Failed to send ACK to client (fd=%d, idx=%u, addr=%s:%hu): %s (%zu != %zu)\n",
-		       client->fd, client->idx, sa_addr(&client->src_addr),
-		       sa_port(&client->src_addr), "short write", (size_t)ret,
-		       len);
-		return -EIO;
-	}
-
-	return 0;
-}
 
 static void poll_for_pollout(int fd, int timeout)
 {
@@ -1994,6 +1997,31 @@ again:
 		goto again;
 
 	return sent;
+}
+
+static int gwk_server_send_ack(struct gwk_client *client)
+{
+	struct pkt pkt;
+	ssize_t ret;
+	size_t len;
+
+	len = prep_pkt_server_ack(&pkt);
+	ret = force_send_all(client->fd, &pkt, len);
+	if (ret < 0) {
+		ret = -errno;
+		perror("send");
+		return ret;
+	}
+
+	if ((size_t)ret != len) {
+		pr_err("Failed to send ACK to client (fd=%d, idx=%u, addr=%s:%hu): %s (%zu != %zu)\n",
+		       client->fd, client->idx, sa_addr(&client->src_addr),
+		       sa_port(&client->src_addr), "short write", (size_t)ret,
+		       len);
+		return -EIO;
+	}
+
+	return 0;
 }
 
 static int gwk_server_eph_send_slave_conn(struct gwk_client *client,
@@ -2077,13 +2105,11 @@ static int gwk_server_eph_handle_accept(struct gwk_client *client,
 		return -EIO;
 	}
 
+	memset(&addr, 0, sizeof(addr));
 	len = sizeof(addr);
 	ret = accept(pfd->fd, (struct sockaddr *)&addr, &len);
-	if (ret < 0) {
-		ret = -errno;
-		perror("accept");
-		return ret;
-	}
+	if (ret < 0)
+		return accept_err_translate(-errno);
 
 	/*
 	 * gwk_server_eph_assign_client() owns the fd, so we don't need to
@@ -2132,18 +2158,32 @@ static int _gwk_server_eph_poll(struct gwk_client *client, uint32_t nr_events)
 
 		nr_events--;
 
-		if (pfd->fd == client->pipe_fd[0]) {
+		if (pfd->fd == client->pipe_fd[0])
 			ret = consume_pipe_data(client);
-			if (ret)
-				break;
-		} else if (!udata->ptr) {
+		else if (!udata->ptr)
 			ret = gwk_server_eph_handle_accept(client, pfd);
-		} else {
+		else
 			ret = gwk_server_eph_handle_client(client, pfd, udata);
-		}
 
 		if (ret)
 			break;
+	}
+
+	return ret;
+}
+
+static int gwk_poll(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+	int ret;
+
+	ret = poll(fds, nfds, timeout);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EINTR)
+			return 0;
+
+		perror("poll");
+		return ret;
 	}
 
 	return ret;
@@ -2156,18 +2196,9 @@ static int gwk_server_eph_poll(struct gwk_client *client)
 	nfds_t nfds = ps->nfds;
 	int ret;
 
-	ret = poll(fds, nfds, 1000);
-	if (ret <= 0) {
-		if (!ret)
-			return 0;
-
-		ret = -errno;
-		if (ret == -EINTR)
-			return 0;
-
-		perror("poll");
+	ret = gwk_poll(fds, nfds, -1);
+	if (ret <= 0)
 		return ret;
-	}
 
 	return _gwk_server_eph_poll(client, (uint32_t)ret);
 }
@@ -2188,7 +2219,7 @@ static void *gwk_server_eph_thread(void *data)
 	free(epht);
 
 	ret = gwk_server_send_ack(client);
-	if (ret < 0  || true)
+	if (ret < 0)
 		goto out;
 
 	while (!client->stop) {
@@ -2239,6 +2270,8 @@ static int gwk_server_init_client_for_epht(struct gwk_client *client)
 	if (ret < 0)
 		goto out_destroy_slave_slot;
 
+	set_nonblock(client->pipe_fd[0]);
+	set_nonblock(client->pipe_fd[1]);
 	client->poll_slot = ps;
 	return 0;
 
@@ -2287,7 +2320,7 @@ static int gwk_server_handle_client_is_ready(struct gwk_server_ctx *ctx,
 	epht->ctx = ctx;
 	epht->client = client;
 
-	gwk_client_refcnt_add(client);
+	gwk_client_refcnt_inc(client);
 	eph_thread = &client->eph_thread;
 	pthread_mutex_lock(&client->lock);
 	ret = pthread_create(eph_thread, NULL, gwk_server_eph_thread, epht);
@@ -2304,10 +2337,146 @@ static int gwk_server_handle_client_is_ready(struct gwk_server_ctx *ctx,
 	return 0;
 }
 
+static bool slave_conn_cmp_sockaddr(struct pkt_slave_conn *sc,
+				    struct sockaddr_storage *addr)
+{
+	if (sc->addr.family == 4) {
+		struct sockaddr_in *s = (struct sockaddr_in *)addr;
+
+		if (s->sin_family != AF_INET)
+			return false;
+
+		if (memcmp(&s->sin_addr, &sc->addr.v4, sizeof(s->sin_addr)))
+			return false;
+
+		if (s->sin_port != sc->addr.port)
+			return false;
+	} else {
+		struct sockaddr_in6 *s = (struct sockaddr_in6 *)addr;
+
+		if (s->sin6_family != AF_INET6)
+			return false;
+		
+		if (memcmp(&s->sin6_addr, &sc->addr.v6, sizeof(s->sin6_addr)))
+			return false;
+
+		if (s->sin6_port != sc->addr.port)
+			return false;
+	}
+
+	return true;
+}
+
+static int _gwk_server_assign_conn_back(struct gwk_client *master,
+					struct gwk_client *client,
+					uint32_t slave_idx)
+{
+	struct pkt_slave_conn *conn = &client->rpkt.slave_conn;
+	struct gwk_slave_pair *pair;
+	struct gwk_slave *a, *b;
+	int ret;
+
+	pair = &master->slave_slot.entries[slave_idx];
+	if (gwk_slave_pair_refcnt_inc(pair) == 1) {
+		ret = -EINVAL;
+		pr_err("Slave %u of %s:%hu is not connected\n", slave_idx,
+		       sa_addr(&master->src_addr), sa_port(&master->src_addr));
+		goto out;
+	}
+
+	a = &pair->a;
+	if (a->fd == -1) {
+		ret = -EINVAL;
+		pr_err("Slave %u of %s:%hu is not connected\n", slave_idx,
+		       sa_addr(&master->src_addr), sa_port(&master->src_addr));
+		goto out;
+	}
+
+	if (!slave_conn_cmp_sockaddr(conn, &a->addr)) {
+		ret = -EINVAL;
+		pr_err("Slave %u of %s:%hu connection back address mismatch\n",
+		       slave_idx, sa_addr(&master->src_addr),
+		       sa_port(&master->src_addr));
+		goto out;
+	}
+
+	b = &pair->b;
+	if (b->fd >= -1) {
+		ret = -EINVAL;
+		pr_err("Slave %u of %s:%hu is already connected\n", slave_idx,
+		       sa_addr(&master->src_addr), sa_port(&master->src_addr));
+		goto out;
+	}
+
+	b->fd = client->fd;
+	b->addr = client->src_addr;
+	assert(a->buf);
+	assert(a->buf_len == 0);
+	assert(b->buf);
+	assert(b->buf_len == 0);
+
+	ret = poll_add_slave(master->poll_slot, &master->slave_slot, a, POLLIN);
+	if (ret < 0) {
+		b->fd = -1;
+		pr_err("Failed to add slave (a) %u of %s:%hu to poll: %s\n",
+		       slave_idx, sa_addr(&master->src_addr),
+		       sa_port(&master->src_addr), strerror(-ret));
+		goto out;
+	}
+
+	ret = poll_add_slave(master->poll_slot, &master->slave_slot, b, POLLIN);
+	if (ret < 0) {
+		b->fd = -1;
+		poll_del_slave(master->poll_slot, &master->slave_slot, a);
+		pr_err("Failed to add slave (b) %u of %s:%hu to poll: %s\n",
+		       slave_idx, sa_addr(&master->src_addr),
+		       sa_port(&master->src_addr), strerror(-ret));
+		goto out;
+	}
+
+	client->fd = -2;
+out:
+	gwk_put_slave_pair(&master->slave_slot, pair);
+	return ret;
+}
+
 static int gwk_server_assign_conn_back(struct gwk_server_ctx *ctx,
 				       struct gwk_client *client)
 {
-	return 0;
+	struct pkt_slave_conn *conn = &client->rpkt.slave_conn;
+	struct gwk_client *master;
+	uint32_t master_idx;
+	uint32_t slave_idx;
+	int ret;
+
+	slave_idx = ntohl(conn->slave_idx);
+	master_idx = ntohl(conn->master_idx);
+	if (master_idx >= ctx->cfg.max_clients) {
+		pr_err("%s:%hu sent invalid master index: %u\n",
+		       sa_addr(&client->src_addr), sa_port(&client->src_addr),
+		       master_idx);
+		return -EINVAL;
+	}
+
+	if (slave_idx >= NR_EPH_SLAVE_ENTRIES) {
+		pr_err("%s:%hu sent invalid slave index: %u\n",
+		       sa_addr(&client->src_addr), sa_port(&client->src_addr),
+		       slave_idx);
+		return -EINVAL;
+	}
+
+	master = &ctx->client_slot.entries[master_idx];
+	pthread_mutex_lock(&master->lock);
+	if (master->fd < 0 && !master->stop) {
+		pthread_mutex_unlock(&master->lock);
+		return -EOWNERDEAD;
+	}
+
+	gwk_client_refcnt_inc(master);
+	ret = _gwk_server_assign_conn_back(master, client, slave_idx);
+	gwk_put_client(&ctx->client_slot, master);
+	pthread_mutex_unlock(&master->lock);
+	return ret;
 }
 
 static int gwk_server_handle_client_slave_conn_back(struct gwk_server_ctx *ctx,
@@ -2568,18 +2737,9 @@ static int gwk_server_poll(struct gwk_server_ctx *ctx)
 	nfds_t nfds = ps->nfds;
 	int ret;
 
-	ret = poll(fds, nfds, -1);
-	if (ret <= 0) {
-		if (!ret)
-			return 0;
-
-		ret = -errno;
-		if (ret == -EINTR)
-			return 0;
-
-		perror("poll");
+	ret = gwk_poll(fds, nfds, -1);
+	if (ret <= 0)
 		return ret;
-	}
 
 	return _gwk_server_poll(ctx, (uint32_t)ret);
 }
