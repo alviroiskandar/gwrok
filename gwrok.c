@@ -210,7 +210,6 @@ struct gwk_slave_slot {
 struct gwk_client {
 	volatile bool			stop;
 	volatile bool			need_join;
-	volatile bool			need_kill;
 	bool				handshake_ok;
 
 	/*
@@ -222,6 +221,12 @@ struct gwk_client {
 	 * The ephemeral socket file descriptor.
 	 */
 	int				eph_fd;
+
+	/*
+	 * To wake up the thread that runs the ephemeral socket
+	 * when sleeping in poll().
+	 */
+	int				pipe_fd[2];
 
 	/*
 	 * The index of this client.
@@ -965,6 +970,16 @@ static void free_poll_slot(struct poll_slot *slot)
 	}
 }
 
+static void gwk_close(int *fd)
+{
+	int tmp = *fd;
+
+	if (tmp >= 0) {
+		*fd = -1;
+		close(tmp);
+	}
+}
+
 static int set_nonblock(int fd)
 {
 	int flags;
@@ -1125,10 +1140,9 @@ static uint32_t gwk_put_slave_pair(struct gwk_slave_slot *ss,
 		free(a->buf);
 	if (b->buf)
 		free(b->buf);
-	if (a->fd >= 0)
-		close(a->fd);
-	if (b->fd >= 0)
-		close(b->fd);
+
+	gwk_close(&a->fd);
+	gwk_close(&b->fd);
 
 	gwk_reset_slave(a);
 	gwk_reset_slave(b);
@@ -1177,14 +1191,18 @@ static void gwk_destroy_slave_slot(struct gwk_slave_slot *ss)
 static void reset_client_entry(struct gwk_client *c)
 {
 	/*
-	 * Clear everything except the index.
+	 * Reset everything except the index and mutex.
 	 */
-	uint32_t idx = c->idx;
+	struct gwk_client tmp;
 
-	memset(c, 0, sizeof(*c));
-	c->fd = -1;
-	c->eph_fd = -1;
-	c->idx = idx;
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.fd = -1;
+	tmp.eph_fd = -1;
+	tmp.pipe_fd[0] = -1;
+	tmp.pipe_fd[1] = -1;
+	tmp.idx = c->idx;
+	memcpy(&tmp.lock, &c->lock, sizeof(tmp.lock));
+	*c = tmp;
 }
 
 static int gwk_init_client_slot(struct gwk_client_slot *cs, uint32_t nr_entries)
@@ -1206,10 +1224,21 @@ static int gwk_init_client_slot(struct gwk_client_slot *cs, uint32_t nr_entries)
 	for (i = 0; i < nr_entries; i++) {
 		entries[i].idx = i;
 		reset_client_entry(&entries[i]);
+
+		ret = pthread_mutex_init(&entries[i].lock, NULL);
+		if (ret)
+			goto out_destroy_mutexes;
 	}
 
 	cs->entries = entries;
 	return 0;
+
+out_destroy_mutexes:
+	while (i-- > 0)
+		pthread_mutex_destroy(&entries[i].lock);
+	destroy_free_slot(&cs->fs);
+	free(entries);
+	return -ret;
 }
 
 static uint32_t gwk_client_refcnt_add(struct gwk_client *c)
@@ -1222,20 +1251,12 @@ static struct gwk_client *gwk_get_client(struct gwk_client_slot *cs)
 	struct gwk_client *c;
 	uint32_t refcnt;
 	int64_t idx;
-	int ret;
 
 	idx = pop_free_slot(&cs->fs);
 	if (idx < 0)
 		return NULL;
 
 	c = &cs->entries[idx];
-
-	ret = pthread_mutex_init(&c->lock, NULL);
-	if (ret) {
-		push_free_slot(&cs->fs, c->idx);
-		return NULL;
-	}
-
 	refcnt = gwk_client_refcnt_add(c);
 
 	assert(refcnt == 1u);
@@ -1245,17 +1266,28 @@ static struct gwk_client *gwk_get_client(struct gwk_client_slot *cs)
 	return c;
 }
 
-static uint32_t gwk_put_client(struct gwk_client_slot *cs, struct gwk_client *c)
+
+static void notify_eph_thread(struct gwk_client *c)
 {
-	uint32_t refcnt = atomic_fetch_sub(&c->refcnt, 1u) - 1u;
+	char buf[1] = { 0 };
+	ssize_t ret;
 
-	if (refcnt)
-		return refcnt;
+	ret = write(c->pipe_fd[1], buf, sizeof(buf));
+	if (ret < 0) {
+		pr_err("Failed to notify eph thread: %s\n", strerror(errno));
+		return;
+	}
+}
 
+static void gwk_prepare_reset_client(struct gwk_client *c)
+{
 	pthread_mutex_lock(&c->lock);
 
 	c->stop = true;
-	assert(!c->need_kill);
+	if (c->pipe_fd[0] >= 0) {
+		assert(c->pipe_fd[1] >= 0);
+		notify_eph_thread(c);
+	}
 
 	if (c->need_join) {
 		c->need_join = false;
@@ -1264,15 +1296,36 @@ static uint32_t gwk_put_client(struct gwk_client_slot *cs, struct gwk_client *c)
 		pthread_mutex_lock(&c->lock);
 	}
 
-	if (c->poll_slot)
+	/*
+	 * The refcnt must be 0 at this point.
+	 */
+	assert(!atomic_load_explicit(&c->refcnt, memory_order_relaxed));
+
+	if (c->poll_slot) {
 		free_poll_slot(c->poll_slot);
+		c->poll_slot = NULL;
+	}
 
-	if (c->slave_slot.entries)
+	if (c->slave_slot.entries) {
 		gwk_destroy_slave_slot(&c->slave_slot);
+		c->slave_slot.entries = NULL;
+	}
 
+	gwk_close(&c->pipe_fd[1]);
+	gwk_close(&c->pipe_fd[0]);
+	gwk_close(&c->fd);
+	gwk_close(&c->eph_fd);
 	pthread_mutex_unlock(&c->lock);
+}
 
-	pthread_mutex_destroy(&c->lock);
+static uint32_t gwk_put_client(struct gwk_client_slot *cs, struct gwk_client *c)
+{
+	uint32_t refcnt = atomic_fetch_sub(&c->refcnt, 1u) - 1u;
+
+	if (refcnt)
+		return refcnt;
+
+	gwk_prepare_reset_client(c);
 	reset_client_entry(c);
 	push_free_slot(&cs->fs, c->idx);
 	return 0u;
@@ -1283,33 +1336,9 @@ static void __gwk_destroy_client_slot(struct gwk_client *entries, uint32_t n)
 	uint32_t i;
 
 	for (i = 0; i < n; i++) {
-		struct gwk_client *c = &entries[i];
-
-		c->stop = true;
-		if (c->need_kill) {
-			pthread_kill(c->eph_thread, SIGTERM);
-			assert(c->need_join);
-		}
-
-		if (c->need_join) {
-			c->need_join = false;
-			pthread_join(c->eph_thread, NULL);
-		}
-
-		/*
-		 * The reference count has to be zero before we can
-		 * safely destroy the client entry.
-		 */
-		assert(!atomic_load_explicit(&c->refcnt, memory_order_relaxed));
-
-		if (c->fd >= 0)
-			close(c->fd);
-		if (c->eph_fd >= 0)
-			close(c->eph_fd);
-		if (c->poll_slot)
-			free_poll_slot(c->poll_slot);
-		if (c->slave_slot.entries)
-			gwk_destroy_slave_slot(&c->slave_slot);
+		gwk_prepare_reset_client(&entries[i]);
+		pthread_mutex_destroy(&entries[i].lock);
+		reset_client_entry(&entries[i]);
 	}
 }
 
@@ -1598,12 +1627,8 @@ static void gwk_server_close_client(struct gwk_server_ctx *ctx,
 
 	assert(client->fd >= 0);
 
-	pthread_mutex_lock(&client->lock);
 	client->stop = true;
-	if (client->need_kill)
-		pthread_kill(client->eph_thread, SIGTERM);
-	pthread_mutex_unlock(&client->lock);
-
+	notify_eph_thread(client);
 	pthread_mutex_lock(&ctx->poll_slot->lock);
 	poll_slot_for_each(ps, idx, pfd, udata) {
 		if (pfd->fd != client->fd)
@@ -1619,12 +1644,9 @@ static void gwk_server_close_client(struct gwk_server_ctx *ctx,
 		break;
 	}
 	pthread_mutex_unlock(&ctx->poll_slot->lock);
-
-	close(client->fd);
-	gwk_put_client(&ctx->client_slot, client);
-
 	assert(found_in_poll);
 	(void)found_in_poll;
+	gwk_put_client(&ctx->client_slot, client);
 }
 
 static int gwk_server_handle_accept(struct gwk_server_ctx *ctx,
@@ -2080,6 +2102,18 @@ static int gwk_server_eph_handle_client(struct gwk_client *client,
 	return 0;
 }
 
+static int consume_pipe_data(struct gwk_client *client)
+{
+	char buf[1];
+
+	if (read(client->pipe_fd[0], buf, sizeof(buf)) < 0) {
+		perror("read");
+		return -errno;
+	}
+
+	return 0;
+}
+
 static int _gwk_server_eph_poll(struct gwk_client *client, uint32_t nr_events)
 {
 	struct poll_slot *ps = client->poll_slot;
@@ -2098,26 +2132,21 @@ static int _gwk_server_eph_poll(struct gwk_client *client, uint32_t nr_events)
 
 		nr_events--;
 
-		/*
-		 * The listening socket doesn't have a udata.
-		 */
-		if (!udata->ptr)
+		if (pfd->fd == client->pipe_fd[0]) {
+			ret = consume_pipe_data(client);
+			if (ret)
+				break;
+		} else if (!udata->ptr) {
 			ret = gwk_server_eph_handle_accept(client, pfd);
-		else
+		} else {
 			ret = gwk_server_eph_handle_client(client, pfd, udata);
+		}
 
 		if (ret)
 			break;
 	}
 
 	return ret;
-}
-
-static void gwk_server_client_set_need_kill(struct gwk_client *c, bool v)
-{
-	pthread_mutex_lock(&c->lock);
-	c->need_kill = v;
-	pthread_mutex_unlock(&c->lock);
 }
 
 static int gwk_server_eph_poll(struct gwk_client *client)
@@ -2127,9 +2156,7 @@ static int gwk_server_eph_poll(struct gwk_client *client)
 	nfds_t nfds = ps->nfds;
 	int ret;
 
-	gwk_server_client_set_need_kill(client, true);
-	ret = poll(fds, nfds, -1);
-	gwk_server_client_set_need_kill(client, false);
+	ret = poll(fds, nfds, 1000);
 	if (ret <= 0) {
 		if (!ret)
 			return 0;
@@ -2161,7 +2188,7 @@ static void *gwk_server_eph_thread(void *data)
 	free(epht);
 
 	ret = gwk_server_send_ack(client);
-	if (ret < 0)
+	if (ret < 0  || true)
 		goto out;
 
 	while (!client->stop) {
@@ -2173,6 +2200,7 @@ static void *gwk_server_eph_thread(void *data)
 out:
 	pthread_mutex_lock(&client->lock);
 	if (client->need_join) {
+		shutdown(client->fd, SHUT_RDWR);
 		client->need_join = false;
 		pthread_detach(client->eph_thread);
 	}
@@ -2186,25 +2214,42 @@ static int gwk_server_init_client_for_epht(struct gwk_client *client)
 	struct poll_slot *ps;
 	int ret;
 
+	ret = pipe(client->pipe_fd);
+	if (ret < 0) {
+		ret = -errno;
+		perror("pipe");
+		return ret;
+	}
+
 	ps = alloc_poll_slot(NR_EPH_SLAVE_ENTRIES + 1u);
-	if (!ps)
-		return -ENOMEM;
+	if (!ps) {
+		ret = -ENOMEM;
+		goto out_close_pipe;
+	}
 
 	ret = gwk_init_slave_slot(&client->slave_slot, NR_EPH_SLAVE_ENTRIES);
-	if (ret < 0) {
-		free_poll_slot(ps);
-		return ret;
-	}
+	if (ret < 0)
+		goto out_free_poll_slot;
 
 	ret = poll_add(ps, client->eph_fd, POLLIN, NULL);
-	if (ret < 0) {
-		gwk_destroy_slave_slot(&client->slave_slot);
-		free_poll_slot(ps);
-		return ret;
-	}
+	if (ret < 0)
+		goto out_destroy_slave_slot;
+
+	ret = poll_add(ps, client->pipe_fd[0], POLLIN, NULL);
+	if (ret < 0)
+		goto out_destroy_slave_slot;
 
 	client->poll_slot = ps;
 	return 0;
+
+out_destroy_slave_slot:
+	gwk_destroy_slave_slot(&client->slave_slot);
+out_free_poll_slot:
+	free_poll_slot(ps);
+out_close_pipe:
+	gwk_close(&client->pipe_fd[0]);
+	gwk_close(&client->pipe_fd[1]);
+	return ret;
 }
 
 static int gwk_server_handle_client_is_ready(struct gwk_server_ctx *ctx,
@@ -2229,7 +2274,7 @@ static int gwk_server_handle_client_is_ready(struct gwk_server_ctx *ctx,
 
 	ret = gwk_server_init_client_for_epht(client);
 	if (ret < 0) {
-		pr_err("Failed to client ephemeral thread (%s:%hu): %s\n",
+		pr_err("Failed to init ephemeral thread (%s:%hu): %s\n",
 		       sa_addr(&client->src_addr), sa_port(&client->src_addr),
 		       strerror(-ret));
 		return ret;
@@ -2262,10 +2307,6 @@ static int gwk_server_handle_client_is_ready(struct gwk_server_ctx *ctx,
 static int gwk_server_assign_conn_back(struct gwk_server_ctx *ctx,
 				       struct gwk_client *client)
 {
-
-	if (client->need_kill)
-		pthread_kill(client->eph_thread, SIGUSR1);
-
 	return 0;
 }
 
@@ -2465,10 +2506,8 @@ static int gwk_server_handle_client(struct gwk_server_ctx *ctx,
 	int ret = 0;
 
 	assert(pfd->fd == client->fd);
-	if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
-		pr_err("Poll error on client socket: %hd\n", pfd->revents);
-		return -EIO;
-	}
+	if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL))
+		goto out_close;
 
 	if (pfd->revents & POLLIN || client->rpkt_len > PKT_HDR_SIZE) {
 		ret = gwk_server_handle_client_recv(ctx, pfd, client);
@@ -2996,7 +3035,6 @@ out:
 		pr_err("Error: %s\n", strerror(-ret));
 
 	gwk_client_destroy(&ctx);
-	return 0;
 	return 0;
 }
 
