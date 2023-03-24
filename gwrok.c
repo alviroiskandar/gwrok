@@ -151,6 +151,8 @@ static inline size_t pkt_size(uint32_t type)
 	return PKT_HDR_SIZE + ret;
 }
 
+typedef _Atomic(int) atomic_t;
+
 struct poll_udata {
 	union {
 		void		*ptr;
@@ -199,7 +201,7 @@ struct gwk_slave_pair {
 	};
 
 	uint32_t			idx;
-	_Atomic(uint32_t)		refcnt;
+	atomic_t			refcnt;
 };
 
 struct gwk_slave_slot {
@@ -263,7 +265,7 @@ struct gwk_client {
 	pthread_t			eph_thread;
 	pthread_mutex_t			lock;
 
-	_Atomic(uint32_t)		refcnt;
+	atomic_t		refcnt;
 };
 
 struct gwk_client_slot {
@@ -518,6 +520,36 @@ static void gwk_client_ctx_init(struct gwk_client_ctx *ctx, const char *app)
 	cfg->max_clients = DEFAULT_MAX_CLIENTS;
 	ctx->tcp_fd = -1;
 	ctx->app = app;
+}
+
+static inline void atomic_set(atomic_t *v, int i)
+{
+	atomic_store(v, i);
+}
+
+static inline int atomic_read(atomic_t *v)
+{
+	return atomic_load(v);
+}
+
+static inline bool atomic_dec_and_test(atomic_t *v)
+{
+	return atomic_fetch_sub(v, 1) == 1;
+}
+
+static inline bool atomic_inc_and_test(atomic_t *v)
+{
+	return atomic_fetch_add(v, 1) == -1;
+}
+
+static inline void atomic_dec(atomic_t *v)
+{
+	atomic_fetch_sub(v, 1);
+}
+
+static inline void atomic_inc(atomic_t *v)
+{
+	atomic_fetch_add(v, 1);
 }
 
 static bool validate_pkt_addr(struct pkt_addr *pa, size_t len)
@@ -1046,16 +1078,6 @@ static int64_t __push_free_slot(struct free_slot *fs, uint32_t data)
 	return ret;
 }
 
-static int64_t push_free_slot(struct free_slot *fs, uint32_t data)
-{
-	int64_t ret;
-
-	pthread_mutex_lock(&fs->lock);
-	ret = __push_free_slot(fs, data);
-	pthread_mutex_unlock(&fs->lock);
-	return ret;
-}
-
 static int64_t __pop_free_slot(struct free_slot *fs)
 {
 	struct stack32 *stack = fs->stack;
@@ -1066,6 +1088,16 @@ static int64_t __pop_free_slot(struct free_slot *fs)
 	else
 		ret = stack->data[stack->rsp++];
 
+	return ret;
+}
+
+static int64_t push_free_slot(struct free_slot *fs, uint32_t data)
+{
+	int64_t ret;
+
+	pthread_mutex_lock(&fs->lock);
+	ret = __push_free_slot(fs, data);
+	pthread_mutex_unlock(&fs->lock);
 	return ret;
 }
 
@@ -1081,11 +1113,12 @@ static int64_t pop_free_slot(struct free_slot *fs)
 
 static void destroy_free_slot(struct free_slot *fs)
 {
-	if (fs->stack) {
-		pthread_mutex_destroy(&fs->lock);
-		free(fs->stack);
-		memset(fs, 0, sizeof(*fs));
-	}
+	if (!fs->stack)
+		return;
+
+	pthread_mutex_destroy(&fs->lock);
+	free(fs->stack);
+	memset(fs, 0, sizeof(*fs));
 }
 
 static void gwk_reset_slave(struct gwk_slave *slave)
