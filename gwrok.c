@@ -215,6 +215,7 @@ struct gwk_slave_pair {
 
 	uint32_t			idx;
 	atomic_t			refcnt;
+	time_t				created_at;
 };
 
 struct gwk_slave_slot {
@@ -273,6 +274,15 @@ struct gwk_client {
 	};
 	size_t				spkt_len;
 	size_t				rpkt_len;
+
+	/*
+	 * Protected by lock.
+	 *
+	 * The number of slaves that don't have a target yet.
+	 */
+	uint32_t			nr_pending_circuits;
+
+	int				largest_time_diff;
 
 	/*
 	 * The thread that runs the ephemeral socket.
@@ -2382,22 +2392,14 @@ static int gwk_server_eph_assign_client(struct gwk_client *client, int fd,
 		goto out_put;
 	}
 
-	ret = poll_add_slave(client->poll_slot, &client->slave_slot, b, POLLIN);
-	if (ret < 0) {
-		pr_err("Failed to add slave connection to poll (fd=%d, idx=%u, addr=%s:%hu)\n",
-		       client->tcp_fd, client->idx, sa_addr(&client->src_addr),
-		       sa_port(&client->src_addr));
-		goto out_poll_del_a;
-	}
-
+	client->nr_pending_circuits++;
+	slave_pair->created_at = time(NULL);
 	printf("New slave connection for %s:%hu (fd=%d, idx=%u, addr=%s:%hu, slave_idx=%u)\n",
 	       sa_addr(&client->src_addr), sa_port(&client->src_addr), fd,
 	       client->idx, sa_addr(addr), sa_port(addr), slave_pair->idx);
 
 	return 0;
 
-out_poll_del_a:
-	poll_del_slave(client->poll_slot, &client->slave_slot, a);
 out_put:
 	/*
 	 * No need to free the buffer and close the fd, because
@@ -2592,7 +2594,14 @@ static int gwk_slave_pair_forward(struct gwk_slave *in, struct gwk_slave *out)
 	bool is_circuit = (&in->pair->a == in) ? true : false;
 	const char *out_name = is_circuit ? "target" : "circuit";
 	const char *in_name = is_circuit ? "circuit" : "target";
+	struct pollfd tmp = { .fd = -1 };
 	ssize_t ret;
+
+	if (!out->pfd)
+		out->pfd = &tmp;
+
+	if (!in->pfd)
+		in->pfd = &tmp;
 
 	if (in->pfd->revents & POLLOUT) {
 		pr_debug("Handling POLLOUT on %s (fd=%d)\n", in_name, in->fd);
@@ -2714,15 +2723,79 @@ static int _gwk_server_eph_poll(struct gwk_client *client, uint32_t nr_events)
 	return ret;
 }
 
+static const time_t slave_timeout_seconds = 10;
+
+static int gwk_server_eph_scan_timeout_slave(struct gwk_client *client)
+{
+	struct gwk_slave_slot *slot = &client->slave_slot;
+	struct gwk_slave_pair *pair;
+	time_t largest_tdiff = 0;
+	uint32_t i, n;
+	time_t now;
+
+	pthread_mutex_lock(&client->lock);
+	pthread_mutex_lock(&slot->fs.lock);
+	n = slot->fs.stack->rbp;
+	now = time(NULL);
+	for (i = 0; i < n; i++) {
+		time_t tdiff;
+
+		pair = &slot->entries[i];
+		if (atomic_read(&pair->refcnt) == 0)
+			continue;
+
+		/*
+		 * If both sides are connected, skip.
+		 */
+		if (pair->a.fd >= 0 && pair->b.fd >= 0)
+			continue;
+
+		/*
+		 * Pending circuit must not have a target fd.
+		 */
+		assert(pair->b.fd == -1);
+
+		tdiff = now - pair->created_at;
+		if (tdiff < slave_timeout_seconds) {
+			if (tdiff > largest_tdiff)
+				largest_tdiff = tdiff;
+			continue;
+		}
+
+		pthread_mutex_unlock(&slot->fs.lock);
+		pthread_mutex_unlock(&client->lock);
+		gwk_server_eph_close_slave_pair(client, pair);
+		pthread_mutex_lock(&client->lock);
+		pthread_mutex_lock(&slot->fs.lock);
+		client->nr_pending_circuits--;
+	}
+	client->largest_time_diff = largest_tdiff;
+	pthread_mutex_unlock(&slot->fs.lock);
+	pthread_mutex_unlock(&client->lock);
+	return 0;
+}
+
 static int gwk_server_eph_poll(struct gwk_client *client)
 {
+	int timeout;
 	int ret;
 
-	ret = gwk_poll(client->poll_slot, -1);
-	if (ret <= 0)
-		return ret;
+	if (client->nr_pending_circuits > 0) {
+		timeout = slave_timeout_seconds - client->largest_time_diff;
+		if (timeout < 0)
+			timeout = 1000;
+		else
+			timeout *= 1000;
+	} else {
+		timeout = -1;
+	}
 
-	return _gwk_server_eph_poll(client, (uint32_t)ret);
+	ret = gwk_poll(client->poll_slot, timeout);
+	if (ret > 0)
+		ret = _gwk_server_eph_poll(client, (uint32_t)ret);
+
+	gwk_server_eph_scan_timeout_slave(client);
+	return ret;
 }
 
 static void _gwk_server_eph_put_all_slaves(struct gwk_client *client,
