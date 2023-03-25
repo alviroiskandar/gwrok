@@ -2480,6 +2480,11 @@ static void gwk_server_eph_close_slave_pair(struct gwk_client *client,
 		poll_del_slave(client->poll_slot, slot, b);
 	}
 
+	pr_debug("Closing slave connection of %s:%hu (fd_a=%d, fd_b=%d, idx=%u, addr=%s:%hu, slave_idx=%u)\n",
+		 sa_addr(&client->src_addr), sa_port(&client->src_addr),
+		 a->fd, b->fd, client->idx, sa_addr(&client->src_addr),
+		 sa_port(&client->src_addr), pair->idx);
+
 	put_gwk_slave_pair(slot, pair);
 }
 
@@ -2582,12 +2587,11 @@ static int gwk_splice(int fd_in, int fd_out, void *buf, uint32_t buf_size,
 	return 0;
 }
 
-static int _gwk_server_eph_forward(struct gwk_client *client,
-				   struct gwk_slave *in, struct gwk_slave *out)
+static int gwk_slave_pair_forward(struct gwk_slave *in, struct gwk_slave *out)
 {
 	bool is_circuit = (&in->pair->a == in) ? true : false;
-	const char *out_name = is_circuit ? "circuit" : "target";
-	const char *in_name = is_circuit ? "target" : "circuit";
+	const char *out_name = is_circuit ? "target" : "circuit";
+	const char *in_name = is_circuit ? "circuit" : "target";
 	ssize_t ret;
 
 	if (in->pfd->revents & POLLOUT) {
@@ -2615,9 +2619,9 @@ static int _gwk_server_eph_forward(struct gwk_client *client,
 		}
 	}
 
-	if (out->pfd->revents & POLLIN) {
+	if (in->pfd->revents & POLLIN) {
 		bool skip_send = (out->pfd->events & POLLOUT) ? true : false;
-
+		pr_debug("Handling POLLIN on %s (fd=%d)\n", in_name, in->fd);
 		ret = gwk_splice(in->fd, out->fd, in->buf, FORWARD_BUFFER_SIZE,
 				 &in->buf_len, skip_send);
 		if (ret < 0)
@@ -2629,7 +2633,7 @@ static int _gwk_server_eph_forward(struct gwk_client *client,
 			 * remove POLLIN from the pfd to avoid busy loop.
 			 */
 			pr_debug("Removing POLLIN on %s (fd=%d)\n", out_name, in->fd);
-			out->pfd->events &= ~POLLIN;
+			in->pfd->events &= ~POLLIN;
 		}
 
 		if (in->buf_len) {
@@ -2638,7 +2642,7 @@ static int _gwk_server_eph_forward(struct gwk_client *client,
 			 * add POLLOUT to the pfd to send it later.
 			 */
 			pr_debug("Adding POLLOUT on %s (fd=%d)\n", in_name, out->fd);
-			in->pfd->events |= POLLOUT;
+			out->pfd->events |= POLLOUT;
 		}
 	}
 
@@ -2661,7 +2665,7 @@ static int gwk_server_eph_forward(struct gwk_client *client,
 	else
 		out = &pair->a;
 
-	ret = _gwk_server_eph_forward(client, in, out);
+	ret = gwk_slave_pair_forward(in, out);
 	if (ret < 0)
 		goto out_close;
 
