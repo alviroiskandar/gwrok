@@ -11,6 +11,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <time.h>
 #include <poll.h>
 #include <stdio.h>
 #include <errno.h>
@@ -215,7 +216,7 @@ struct gwk_slave_pair {
 
 	uint32_t			idx;
 	atomic_t			refcnt;
-	time_t				created_at;
+	struct timespec			created_at;
 };
 
 struct gwk_slave_slot {
@@ -2352,6 +2353,7 @@ static int gwk_server_eph_assign_client(struct gwk_client *client, int fd,
 					struct sockaddr_storage *addr)
 {
 	struct gwk_slave_pair *slave_pair;
+	struct timespec *created_at;
 	struct gwk_slave *a, *b;
 	int ret = 0;
 
@@ -2393,7 +2395,15 @@ static int gwk_server_eph_assign_client(struct gwk_client *client, int fd,
 	}
 
 	client->nr_pending_circuits++;
-	slave_pair->created_at = time(NULL);
+
+	created_at = &slave_pair->created_at;
+	if (clock_gettime(CLOCK_MONOTONIC, created_at) < 0) {
+		ret = errno;
+		printf_once("Failed to get current time: %s\n", strerror(ret));
+		memset(created_at, 0, sizeof(*created_at));
+	}
+
+
 	printf("New slave connection for %s:%hu (fd=%d, idx=%u, addr=%s:%hu, slave_idx=%u)\n",
 	       sa_addr(&client->src_addr), sa_port(&client->src_addr), fd,
 	       client->idx, sa_addr(addr), sa_port(addr), slave_pair->idx);
@@ -2594,14 +2604,7 @@ static int gwk_slave_pair_forward(struct gwk_slave *in, struct gwk_slave *out)
 	bool is_circuit = (&in->pair->a == in) ? true : false;
 	const char *out_name = is_circuit ? "target" : "circuit";
 	const char *in_name = is_circuit ? "circuit" : "target";
-	struct pollfd tmp = { .fd = -1 };
 	ssize_t ret;
-
-	if (!out->pfd)
-		out->pfd = &tmp;
-
-	if (!in->pfd)
-		in->pfd = &tmp;
 
 	if (in->pfd->revents & POLLOUT) {
 		pr_debug("Handling POLLOUT on %s (fd=%d)\n", in_name, in->fd);
@@ -2618,7 +2621,7 @@ static int gwk_slave_pair_forward(struct gwk_slave *in, struct gwk_slave *out)
 			in->pfd->events &= ~POLLOUT;
 		}
 
-		if (out->buf_len < FORWARD_BUFFER_SIZE) {
+		if (out->buf_len < FORWARD_BUFFER_SIZE && out->pfd) {
 			/*
 			 * We have some space in the buffer, so we can
 			 * add POLLIN to the pfd to receive more data.
@@ -2629,7 +2632,7 @@ static int gwk_slave_pair_forward(struct gwk_slave *in, struct gwk_slave *out)
 	}
 
 	if (in->pfd->revents & POLLIN) {
-		bool skip_send = (out->pfd->events & POLLOUT) ? true : false;
+		bool skip_send = (out->pfd && (out->pfd->events & POLLOUT));
 		pr_debug("Handling POLLIN on %s (fd=%d)\n", in_name, in->fd);
 		ret = gwk_splice(in->fd, out->fd, in->buf, FORWARD_BUFFER_SIZE,
 				 &in->buf_len, skip_send);
@@ -2645,7 +2648,7 @@ static int gwk_slave_pair_forward(struct gwk_slave *in, struct gwk_slave *out)
 			in->pfd->events &= ~POLLIN;
 		}
 
-		if (in->buf_len) {
+		if (in->buf_len && out->pfd) {
 			/*
 			 * We have pending data to send, so we need to
 			 * add POLLOUT to the pfd to send it later.
@@ -2723,20 +2726,30 @@ static int _gwk_server_eph_poll(struct gwk_client *client, uint32_t nr_events)
 	return ret;
 }
 
-static const time_t slave_timeout_seconds = 10;
+static const int32_t slave_timeout_ms = 10000;
+
+static long long timespec_to_ms(struct timespec *ts)
+{
+	return ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
+}
+
+static long long timespec_diff_ms(struct timespec *ts1, struct timespec *ts2)
+{
+	return timespec_to_ms(ts1) - timespec_to_ms(ts2);
+}
 
 static int gwk_server_eph_scan_timeout_slave(struct gwk_client *client)
 {
 	struct gwk_slave_slot *slot = &client->slave_slot;
 	struct gwk_slave_pair *pair;
 	time_t largest_tdiff = 0;
+	struct timespec now;
 	uint32_t i, n;
-	time_t now;
 
 	pthread_mutex_lock(&client->lock);
 	pthread_mutex_lock(&slot->fs.lock);
 	n = slot->fs.stack->rbp;
-	now = time(NULL);
+	clock_gettime(CLOCK_MONOTONIC, &now);
 	for (i = 0; i < n; i++) {
 		time_t tdiff;
 
@@ -2755,8 +2768,12 @@ static int gwk_server_eph_scan_timeout_slave(struct gwk_client *client)
 		 */
 		assert(pair->b.fd == -1);
 
-		tdiff = now - pair->created_at;
-		if (tdiff < slave_timeout_seconds) {
+		/*
+		 * If the slave target is not connected, check if it has
+		 * timed out. If it has, close the slave pair.
+		 */
+		tdiff = timespec_diff_ms(&now, &pair->created_at);
+		if (tdiff < slave_timeout_ms) {
 			if (tdiff > largest_tdiff)
 				largest_tdiff = tdiff;
 			continue;
@@ -2781,11 +2798,9 @@ static int gwk_server_eph_poll(struct gwk_client *client)
 	int ret;
 
 	if (client->nr_pending_circuits > 0) {
-		timeout = slave_timeout_seconds - client->largest_time_diff;
+		timeout = slave_timeout_ms - client->largest_time_diff;
 		if (timeout < 0)
-			timeout = 1000;
-		else
-			timeout *= 1000;
+			timeout = 0;
 	} else {
 		timeout = -1;
 	}
