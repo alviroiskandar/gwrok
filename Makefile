@@ -10,4 +10,4 @@ gwrok: gwrok.c
 clean:
 	rm -f gwrok
 
-.PHONY: clean
+.PHONY: all clean
