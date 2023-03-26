@@ -1,6 +1,7 @@
 # gwrok
 A simple TCP port forwarder for GNU/Weeb. Inspired by [ngrok](https://ngrok.com/).
 
+![gwrok visualization](gwrok.drawio.svg?raw=true "gwrok visualization")
 
 # Dependencies
   - make (build only)
