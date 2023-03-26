@@ -296,6 +296,11 @@ struct gwk_client {
 	pthread_t			eph_thread;
 	pthread_mutex_t			lock;
 
+	/*
+	 * A counter to avoid calling timeout scan too frequently.
+	 */
+	uint32_t			c_timeout_scan;
+
 	atomic_t			refcnt;
 };
 
@@ -2858,14 +2863,17 @@ static int gwk_server_eph_scan_timeout_slave(struct gwk_client *client)
 
 static int gwk_server_eph_poll(struct gwk_client *client)
 {
+	bool should_scan;
 	int timeout;
 	int ret;
 
 	if (client->nr_pending_circuits > 0) {
+		should_scan = true;
 		timeout = slave_timeout_ms - client->largest_time_diff;
 		if (timeout < 0)
 			timeout = 0;
 	} else {
+		should_scan = false;
 		timeout = -1;
 	}
 
@@ -2873,7 +2881,18 @@ static int gwk_server_eph_poll(struct gwk_client *client)
 	if (ret > 0)
 		ret = _gwk_server_eph_poll(client, (uint32_t)ret);
 
-	gwk_server_eph_scan_timeout_slave(client);
+	if (should_scan && ret > 0) {
+		/*
+		 * Do not scan too often if we are busy handling
+		 * events.
+		 */
+		should_scan = should_scan &&
+			      (client->c_timeout_scan++ % 8 == 0);
+	}
+
+	if (should_scan)
+		gwk_server_eph_scan_timeout_slave(client);
+
 	return ret;
 }
 
