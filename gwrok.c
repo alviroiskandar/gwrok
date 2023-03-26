@@ -45,6 +45,10 @@
 #define __packed		__attribute__((__packed__))
 #endif
 
+#ifndef __maybe_unused
+#define __maybe_unused		__attribute__((__unused__))
+#endif
+
 #define pr_debug(...)			\
 do {					\
 	if (g_verbose)			\
@@ -988,7 +992,7 @@ static int poll_add(struct poll_slot *slot, int fd, int events,
 	return ret;
 }
 
-static void poll_del(struct poll_slot *slot, nfds_t idx)
+__maybe_unused static void poll_del(struct poll_slot *slot, nfds_t idx)
 {
 	pthread_mutex_lock(&slot->lock);
 	assert(idx < slot->nfds);
@@ -1134,7 +1138,8 @@ static int64_t __pop_free_slot(struct free_slot *fs)
 	return ret;
 }
 
-static int64_t push_free_slot(struct free_slot *fs, uint32_t data)
+__maybe_unused static int64_t push_free_slot(struct free_slot *fs,
+					     uint32_t data)
 {
 	int64_t ret;
 
@@ -1144,7 +1149,7 @@ static int64_t push_free_slot(struct free_slot *fs, uint32_t data)
 	return ret;
 }
 
-static int64_t pop_free_slot(struct free_slot *fs)
+__maybe_unused static int64_t pop_free_slot(struct free_slot *fs)
 {
 	int64_t ret;
 
@@ -2051,10 +2056,12 @@ static int gwk_pkt_validate_consume(struct pkt *pkt, size_t len)
 static void gwk_server_append_spkt(struct gwk_client *client, struct pkt *pkt,
 				   size_t len)
 {
-	struct pkt *spkt = &client->spkt;
+	struct pkt *spkt;
 	size_t remaining;
 	char *dst;
 
+	pthread_mutex_lock(&client->lock);
+	spkt = &client->spkt;
 	assert(len <= sizeof(*spkt));
 	dst = (char *)spkt + client->spkt_len;
 
@@ -2070,6 +2077,7 @@ static void gwk_server_append_spkt(struct gwk_client *client, struct pkt *pkt,
 
 	memcpy(dst, pkt, len);
 	client->spkt_len += len;
+	pthread_mutex_unlock(&client->lock);
 }
 
 static ssize_t gwk_server_send(struct gwk_client *client)
@@ -3101,6 +3109,7 @@ static int gwk_server_assign_conn_back(struct gwk_server_ctx *ctx,
 	pthread_mutex_lock(&master->lock);
 	ret = _gwk_server_assign_conn_back(master, client, slave_idx);
 	pthread_mutex_unlock(&master->lock);
+
 out_put:
 	pthread_mutex_unlock(&ctx->client_slot.fs.lock);
 	put_gwk_client(&ctx->client_slot, master);
@@ -3119,6 +3128,40 @@ static int gwk_server_handle_client_slave_conn_back(struct gwk_server_ctx *ctx,
 	}
 
 	return gwk_server_assign_conn_back(ctx, client);
+}
+
+static int gwk_server_handle_client_term_slave(struct gwk_client *client)
+{
+	struct pkt *pkt = &client->rpkt;
+	struct pkt_term_slave *term = &pkt->term_slave;
+	struct gwk_slave_pair *sp;
+	uint32_t slave_idx;
+	int ret = 0;
+
+	if (!validate_pkt_client_term_slave(pkt, client->rpkt_len)) {
+		pr_err("%s:%hu sent invalid client_term_slave packet\n",
+		       sa_addr(&client->src_addr), sa_port(&client->src_addr));
+		return -EBADMSG;
+	}
+
+	slave_idx = ntohl(term->slave_idx);
+	pthread_mutex_lock(&client->slave_slot.fs.lock);
+	sp = &client->slave_slot.entries[slave_idx];
+	if (atomic_read(&sp->refcnt) == 0) {
+		pr_err("%s:%hu tries to terminate a non-existent slave (slave_idx=%u)\n",
+		       sa_addr(&client->src_addr), sa_port(&client->src_addr),
+		       slave_idx);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (sp->a.fd >= 0)
+		shutdown(sp->a.fd, SHUT_RDWR);
+	if (sp->b.fd >= 0)
+		shutdown(sp->b.fd, SHUT_RDWR);
+out:
+	pthread_mutex_unlock(&client->slave_slot.fs.lock);
+	return ret;
 }
 
 static int gwk_server_handle_packet(struct gwk_server_ctx *ctx,
@@ -3145,10 +3188,10 @@ static int gwk_server_handle_packet(struct gwk_server_ctx *ctx,
 		ret = gwk_server_handle_client_slave_conn_back(ctx, client);
 		bytes_eaten += sizeof(pkt->slave_conn_back);
 		break;
-	// case PKT_TYPE_CLIENT_TERMINATE_SLAVE:
-	// 	ret = gwk_server_handle_client_term_slave(client);
-	// 	bytes_eaten += sizeof(pkt->term_slave);
-	// 	break;
+	case PKT_TYPE_CLIENT_TERMINATE_SLAVE:
+		ret = gwk_server_handle_client_term_slave(client);
+		bytes_eaten += sizeof(pkt->term_slave);
+		break;
 	default:
 		pr_err("Client %s:%hu sent unknown packet type %u",
 		       sa_addr(&client->src_addr), sa_port(&client->src_addr),
@@ -3238,10 +3281,27 @@ out_err:
 	return ret;
 }
 
-static int gwk_server_handle_client_send(struct gwk_server_ctx *ctx,
-					 struct pollfd *pfd,
+static int gwk_server_handle_client_send(struct pollfd *pfd,
 					 struct gwk_client *client)
 {
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	buf = (char *)&client->spkt;
+	len = client->spkt_len;
+	ret = gwk_send(client->tcp_fd, buf, len, MSG_DONTWAIT);
+	if (ret <= 0)
+		return ret;
+
+	pthread_mutex_lock(&client->lock);
+	pfd->events |= POLLIN;
+	client->spkt_len -= ret;
+	if (client->spkt_len)
+		memmove(buf, buf + ret, client->spkt_len);
+	else
+		pfd->events &= ~POLLOUT;
+	pthread_mutex_unlock(&client->lock);
 	return 0;
 }
 
@@ -3264,7 +3324,7 @@ static int gwk_server_handle_client(struct gwk_server_ctx *ctx,
 	}
 
 	if (pfd->revents & POLLOUT) {
-		ret = gwk_server_handle_client_send(ctx, pfd, client);
+		ret = gwk_server_handle_client_send(pfd, client);
 		if (ret)
 			goto out_close;
 	}
