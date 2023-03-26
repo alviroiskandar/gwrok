@@ -3039,6 +3039,39 @@ static bool slave_conn_cmp_sockaddr(struct pkt_slave_conn *sc,
 	return true;
 }
 
+static void slave_conn_to_sockaddr(struct pkt_slave_conn *sc,
+				   struct sockaddr_storage *addr)
+{
+	memset(addr, 0, sizeof(*addr));
+	if (sc->addr.family == 4) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+
+		sin->sin_family = AF_INET;
+		sin->sin_port = sc->addr.port;
+		memcpy(&sin->sin_addr, &sc->addr.v4, sizeof(sin->sin_addr));
+	} else {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+
+		sin6->sin6_family = AF_INET6;
+		sin6->sin6_port = sc->addr.port;
+		memcpy(&sin6->sin6_addr, &sc->addr.v6, sizeof(sin6->sin6_addr));
+	}
+}
+
+static void print_conn_cmp_mismatch(struct gwk_client *client,
+				    struct pkt_slave_conn *sc,
+				    struct sockaddr_storage *addr,
+				    uint32_t slave_id)
+{
+	struct sockaddr_storage cb_addr;
+
+	slave_conn_to_sockaddr(sc, &cb_addr);
+	printf("%s:%hu sent a mismatch conn back (slave_id=%u, expected=%s:%hu, actual=%s:%hu)",
+	       sa_addr(&client->src_addr), sa_port(&client->src_addr),
+	       slave_id, sa_addr(addr), sa_port(addr),
+	       sa_addr(&cb_addr), sa_port(&cb_addr));
+}
+
 static int _gwk_server_assign_conn_back(struct gwk_client *master,
 					struct gwk_client *client,
 					uint32_t slave_idx)
@@ -3060,9 +3093,7 @@ static int _gwk_server_assign_conn_back(struct gwk_client *master,
 	}
 
 	if (!slave_conn_cmp_sockaddr(conn, &sp->a.addr)) {
-		pr_err("The slave connection of %s:%hu is not the same as the one of %s:%hu (slave_idx=%u)\n",
-		       sa_addr(&client->src_addr), sa_port(&client->src_addr),
-		       sa_addr(&sp->a.addr), sa_port(&sp->a.addr), slave_idx);
+		print_conn_cmp_mismatch(master, conn, &sp->a.addr, slave_idx);
 		ret = -EINVAL;
 		goto out;
 	}
@@ -3925,25 +3956,6 @@ static int gwk_client_send_slave_conn(struct gwk_client_ctx *ctx,
 	}
 
 	return 0;
-}
-
-static void slave_conn_to_sockaddr(struct pkt_slave_conn *sc,
-				   struct sockaddr_storage *addr)
-{
-	memset(addr, 0, sizeof(*addr));
-	if (sc->addr.family == 4) {
-		struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-
-		sin->sin_family = AF_INET;
-		sin->sin_port = sc->addr.port;
-		memcpy(&sin->sin_addr, &sc->addr.v4, sizeof(sin->sin_addr));
-	} else {
-		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
-
-		sin6->sin6_family = AF_INET6;
-		sin6->sin6_port = sc->addr.port;
-		memcpy(&sin6->sin6_addr, &sc->addr.v6, sizeof(sin6->sin6_addr));
-	}
 }
 
 static int gwk_client_terminate_slave(struct gwk_client_ctx *ctx, uint32_t idx)
