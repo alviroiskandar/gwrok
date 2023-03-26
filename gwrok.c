@@ -2828,11 +2828,6 @@ static int gwk_server_eph_scan_timeout_slave(struct gwk_client *client)
 			continue;
 
 		/*
-		 * A pending circuit must not have a target fd.
-		 */
-		assert(pair->b.fd == -1);
-
-		/*
 		 * If the slave target is not connected, check if it has
 		 * timed out. If it has, close the slave pair.
 		 */
