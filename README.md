@@ -1,6 +1,19 @@
 # gwrok
 A simple TCP port forwarder for GNU/Weeb. Inspired by [ngrok](https://ngrok.com/).
 
+
+# Dependencies
+  - make (build only)
+  - gcc (build only)
+  - libc
+
+
+# How to build gwrok?
+```
+sudo apt-get install make gcc -y;
+make;
+```
+
 ## gwrok client
 ```
 viro@freezing-night:~/p/gwrok$ ./gwrok client --help
@@ -36,8 +49,26 @@ Options:
 
 ```
 
+
+# Client usage example
+For example, if you have a web server running on your local machine with address
+127.0.0.1 and port 80. You want to make it accessible from the internet. You can
+use gwrok to do that:
+```
+./gwrok client --target-addr 127.0.0.1 --target-port 80
+```
+By default it will use my server 188.166.250.196:8000. It will not last forever
+though. You can also use your own gwrok server by specifying the server address
+and port with `--server-addr` and `--server-port` options.
+
+tq
+
+-- Viro
+
+
 # License
 GNU General Public License v2.0
+
 
 # Author
 Alviro Iskandar Setiawan &lt;alviro.iskandar@gnuweeb.org&gt;
