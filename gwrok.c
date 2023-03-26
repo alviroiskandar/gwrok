@@ -345,6 +345,18 @@ struct gwk_server_ctx {
 	const char			*app;
 };
 
+/*
+ * fc = fast connect
+ *
+ * For non-blocking connect() tracking.
+ */
+struct gwk_client_fc {
+	uint8_t		a_con: 1;
+	uint8_t		b_con: 1;
+	uint32_t	slave_idx;
+	uint32_t	master_idx;
+};
+
 struct gwk_client_ctx {
 	volatile bool			stop;
 	bool				need_join;
@@ -354,6 +366,7 @@ struct gwk_client_ctx {
 	struct poll_slot		*poll_slot_main;
 	struct poll_slot		*poll_slot_circuit;
 	struct gwk_slave_slot		slave_slot;
+	struct gwk_client_fc		*fc_track;
 	union {
 		struct pkt		spkt;
 		char			__spkt[sizeof(struct pkt) * 4];
@@ -366,6 +379,13 @@ struct gwk_client_ctx {
 	size_t				spkt_len;
 	struct sockaddr_storage		target_addr;
 	struct sockaddr_storage		server_addr;
+	/*
+	 * Protects the following fields:
+	 *  - poll_slot_circuit
+	 *  - slave_slot
+	 *  - fc_track
+	 */
+	pthread_mutex_t			circuit_lock;
 	pthread_t			circuit_thread;
 	struct gwk_client_cfg		cfg;
 	const char			*app;
@@ -3566,13 +3586,33 @@ static int gwk_client_init_slave_slot(struct gwk_client_ctx *ctx)
 	return 0;
 }
 
-static int create_sock_and_connect(struct sockaddr_storage *addr)
+static int gwk_client_init_fast_connect_tracking(struct gwk_client_ctx *ctx)
+{
+	struct gwk_client_fc *fc;
+
+	fc = calloc(ctx->cfg.max_clients, sizeof(*fc));
+	if (!fc) {
+		pr_err("Error: Failed to allocate fast connect tracking\n");
+		return -ENOMEM;
+	}
+
+	ctx->fc_track = fc;
+	return 0;
+}
+
+static int create_sock_and_connect(struct sockaddr_storage *addr,
+				   bool non_block)
 {
 	socklen_t len;
+	int flags;
 	int ret;
 	int fd;
 
-	fd = socket(addr->ss_family, SOCK_STREAM, 0);
+	flags = SOCK_STREAM;
+	if (non_block)
+		flags |= SOCK_NONBLOCK;
+
+	fd = socket(addr->ss_family, flags, 0);
 	if (fd < 0) {
 		ret = -errno;
 		perror("socket");
@@ -3584,7 +3624,11 @@ static int create_sock_and_connect(struct sockaddr_storage *addr)
 	len = sizeof(*addr);
 	ret = connect(fd, (struct sockaddr *)addr, len);
 	if (ret < 0) {
+
 		ret = -errno;
+		if (ret == -EINPROGRESS && non_block)
+			return fd;
+
 		perror("connect");
 		close(fd);
 		return ret;
@@ -3601,7 +3645,7 @@ static int gwk_client_connect_to_server(struct gwk_client_ctx *ctx)
 	printf("Connecting to server %s:%hu...\n", cfg->server_addr,
 	       cfg->server_port);
 
-	ret = create_sock_and_connect(&ctx->server_addr);
+	ret = create_sock_and_connect(&ctx->server_addr, false);
 	if (ret < 0)
 		return ret;
 
@@ -3826,6 +3870,146 @@ out_close:
 	gwk_client_close_slave_pair(ctx, pair);
 	return 0;
 }
+
+static int gwk_client_send_slave_conn(int fd, uint32_t slave_idx,
+				      uint32_t master_idx,
+				      struct sockaddr_storage *addr)
+{
+	struct pkt pkt;
+	ssize_t ret;
+	size_t len;
+
+	len = prep_pkt_client_slave_conn_back(&pkt, master_idx, slave_idx, addr);
+	ret = force_send_all(fd, &pkt, len);
+	if (ret < 0) {
+		pr_err("Error: Failed to send slave conn packet: %s\n",
+		       strerror(-ret));
+		return ret;
+	}
+
+	return 0;
+}
+
+static int gwk_client_terminate_slave(struct gwk_client_ctx *ctx, uint32_t idx)
+{
+	struct pkt pkt;
+	ssize_t ret;
+	size_t len;
+
+	len = prep_pkt_client_terminate_slave(&pkt, idx);
+	ret = force_send_all(ctx->tcp_fd, &pkt, len);
+	if (ret < 0) {
+		pr_err("Error: Failed to send terminate slave packet: %s\n",
+		       strerror(-ret));
+		return ret;
+	}
+
+	return 0;
+}
+
+static int gwk_client_handle_slave(struct gwk_client_ctx *ctx,
+				   struct gwk_slave *slave, struct pollfd *pfd)
+{
+	struct gwk_slave_pair *pair = slave->pair;
+	bool is_connected = false;
+	struct gwk_client_fc *fc;
+	uint32_t master_idx;
+	uint32_t slave_idx;
+	socklen_t len;
+	bool is_a;
+	int ret;
+
+	is_a = (slave == &pair->a);
+
+	pthread_mutex_lock(&ctx->circuit_lock);
+	fc = &ctx->fc_track[pair->idx];
+	if (is_a)
+		is_connected = fc->a_con;
+	else
+		is_connected = fc->b_con;
+
+	slave_idx = fc->slave_idx;
+	master_idx = fc->master_idx;
+	pthread_mutex_unlock(&ctx->circuit_lock);
+
+	if (is_connected) {
+		/*
+		 * This client is already connected to the server, so
+		 * we can forward data between the two slaves.
+		 */
+		return gwk_client_forward(ctx, slave);
+	}
+
+
+	/*
+	 * This is the result of a pending connect that was done
+	 * in _gwk_client_handle_slave_conn().
+	 *
+	 * pair->a is a target slave.
+	 * pair->b is a circuit slave.
+	 *
+	 * The circuit has to notify the server that it is ready
+	 * to accept data.
+	 */
+	ret = 0;
+	len = sizeof(ret);
+	if (getsockopt(pfd->fd, SOL_SOCKET, SO_ERROR, &ret, &len)) {
+		pr_err("Error: getsockopt failed: %s\n", strerror(errno));
+		goto out_close;
+	}
+
+	if (ret) {
+		const char *name = is_a ? "target" : "circuit";
+		struct sockaddr_storage *addr;
+
+		if (is_a)
+			addr = &ctx->target_addr;
+		else
+			addr = &ctx->server_addr;
+
+		pr_err("Error: Connect to %s %s:%hu: %s\n", name, sa_addr(addr),
+		       sa_port(addr), strerror(ret));
+		goto out_close;
+	}
+
+	if (pfd->revents & (POLLERR | POLLHUP | POLLNVAL))
+		goto out_close;
+
+	if (is_a) {
+		/*
+		 * This is the pair->a, which is a target slave.
+		 *
+		 * If we don't hit a poll error, we can assume that
+		 * the connection is successful.
+		 */
+		pthread_mutex_lock(&ctx->circuit_lock);
+		fc->a_con = 1;
+		pthread_mutex_unlock(&ctx->circuit_lock);
+		// pr_debug("Connection A OK!\n");
+	} else {
+		/*
+		 * This is the pair->b, which is a circuit slave.
+		 *
+		 * Let the server know that the circuit is ready.
+		 */
+		ret = gwk_client_send_slave_conn(slave->fd, slave_idx,
+						 master_idx, &pair->a.addr);
+		if (ret)
+			goto out_close;
+
+		pthread_mutex_lock(&ctx->circuit_lock);
+		fc->b_con = 1;
+		pthread_mutex_unlock(&ctx->circuit_lock);
+		// pr_debug("Connection B OK!\n");
+	}
+
+	return 0;
+
+out_close:
+	gwk_client_terminate_slave(ctx, slave_idx);
+	gwk_client_close_slave_pair(ctx, pair);
+	return 0;
+}
      
 static int _gwk_client_poll_circuit(struct gwk_client_ctx *ctx,
 				    uint32_t nr_events)
@@ -3846,7 +4030,7 @@ static int _gwk_client_poll_circuit(struct gwk_client_ctx *ctx,
 		if (!udata->ptr)
 			ret = consume_pipe_data(ctx->pipe_fd);
 		else
-			ret = gwk_client_forward(ctx, udata->ptr);
+			ret = gwk_client_handle_slave(ctx, udata->ptr, pfd);
 
 		if (ret)
 			break;
@@ -3933,48 +4117,6 @@ out_close_pipe:
 	return ret;
 }
 
-static int gwk_client_send_slave_conn(struct gwk_client_ctx *ctx,
-				      int fd_a,
-				      struct sockaddr_storage *slave_addr)
-{
-	struct pkt_slave_conn *sc = &ctx->rpkt.slave_conn;
-	uint32_t master_idx;
-	uint32_t slave_idx;
-	struct pkt pkt;
-	ssize_t ret;
-	size_t len;
-
-	master_idx = ntohl(sc->master_idx);
-	slave_idx = ntohl(sc->slave_idx);
-	len = prep_pkt_client_slave_conn_back(&pkt, master_idx, slave_idx,
-					      slave_addr);
-	ret = force_send_all(fd_a, &pkt, len);
-	if (ret < 0) {
-		pr_err("Error: Failed to send slave conn packet: %s\n",
-		       strerror(-ret));
-		return ret;
-	}
-
-	return 0;
-}
-
-static int gwk_client_terminate_slave(struct gwk_client_ctx *ctx, uint32_t idx)
-{
-	struct pkt pkt;
-	ssize_t ret;
-	size_t len;
-
-	len = prep_pkt_client_terminate_slave(&pkt, idx);
-	ret = force_send_all(ctx->tcp_fd, &pkt, len);
-	if (ret < 0) {
-		pr_err("Error: Failed to send terminate slave packet: %s\n",
-		       strerror(-ret));
-		return ret;
-	}
-
-	return 0;
-}
-
 static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 {
 	struct pkt_slave_conn *sc = &ctx->rpkt.slave_conn;
@@ -3990,8 +4132,15 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 		goto out_term;
 	}
 
+	pthread_mutex_lock(&ctx->circuit_lock);
+	ctx->fc_track[pair->idx].a_con = 0;
+	ctx->fc_track[pair->idx].b_con = 0;
+	ctx->fc_track[pair->idx].slave_idx = ntohl(sc->slave_idx);
+	ctx->fc_track[pair->idx].master_idx = ntohl(sc->master_idx);
+	pthread_mutex_unlock(&ctx->circuit_lock);
+
 	addr = &ctx->target_addr;
-	fd_a = create_sock_and_connect(addr);
+	fd_a = create_sock_and_connect(addr, true);
 	if (fd_a < 0) {
 		pr_err("Connect to target: %s:%hu: %s\n", sa_addr(addr),
 		       sa_port(addr), strerror(-fd_a));
@@ -3999,7 +4148,7 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 	}
 
 	addr = &ctx->server_addr;
-	fd_b = create_sock_and_connect(addr);
+	fd_b = create_sock_and_connect(addr, true);
 	if (fd_b < 0) {
 		pr_err("Connect to server: %s:%hu: %s\n", sa_addr(addr),
 		       sa_port(addr), strerror(-fd_b));
@@ -4008,36 +4157,18 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 
 	addr = &pair->a.addr;
 	slave_conn_to_sockaddr(sc, addr);
-	ret = gwk_client_send_slave_conn(ctx, fd_b, addr);
-	if (ret < 0) {
-		pr_err("Failed to send slave conn: %s\n", strerror(-ret));
-		goto out_close_b;
-	}
-
 	pair->a.fd = fd_a;
 	pair->b.fd = fd_b;
 	pair->a.buf_len = 0;
 	pair->b.buf_len = 0;
 
-	ret = set_nonblock(fd_a);
-	if (ret < 0) {
-		pr_err("Failed to set A nonblock: %s\n", strerror(-ret));
-		goto out_close_b;
-	}
-
-	ret = set_nonblock(fd_b);
-	if (ret < 0) {
-		pr_err("Failed to set B nonblock: %s\n", strerror(-ret));
-		goto out_close_b;
-	}
-
-	ret = poll_add_slave(ps, &ctx->slave_slot, &pair->a, POLLIN);
+	ret = poll_add_slave(ps, &ctx->slave_slot, &pair->a, POLLOUT | POLLIN);
 	if (ret < 0) {
 		pr_err("Failed to add slave A to poll: %s\n", strerror(-ret));
 		goto out_close_b;
 	}
 
-	ret = poll_add_slave(ps, &ctx->slave_slot, &pair->b, POLLIN);
+	ret = poll_add_slave(ps, &ctx->slave_slot, &pair->b, POLLOUT | POLLIN);
 	if (ret < 0) {
 		pr_err("Failed to add slave B to poll: %s\n", strerror(-ret));
 		goto out_del_a;
@@ -4291,6 +4422,8 @@ static void gwk_client_destroy_ctx(struct gwk_client_ctx *ctx)
 
 	if (ctx->tcp_fd >= 0)
 		gwk_close(&ctx->tcp_fd);
+
+	pthread_mutex_destroy(&ctx->circuit_lock);
 }
 
 static int server_main(int argc, char *argv[])
@@ -4342,10 +4475,18 @@ static int client_main(int argc, char *argv[])
 	ret = gwk_client_install_signal_handlers(&ctx);
 	if (ret)
 		return ret;
+	ret = pthread_mutex_init(&ctx.circuit_lock, NULL);
+	if (ret) {
+		pr_err("Failed to init circuit lock: %s\n", strerror(ret));
+		return ret;
+	}
 	ret = gwk_client_init_poll_slot(&ctx);
 	if (ret)
-		return ret;
+		goto out;
 	ret = gwk_client_init_slave_slot(&ctx);
+	if (ret)
+		goto out;
+	ret = gwk_client_init_fast_connect_tracking(&ctx);
 	if (ret)
 		goto out;
 	ret = gwk_client_connect_to_server(&ctx);
