@@ -11,6 +11,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+
 #include <time.h>
 #include <poll.h>
 #include <stdio.h>
@@ -1057,6 +1058,7 @@ static void poll_del_slave(struct poll_slot *slot,
 	if (idx < (uintptr_t)slot->nfds) {
 		struct gwk_slave *tmp_slave;
 
+		assert(slot->udata[idx].ptr == slave);
 		slot->fds[idx] = slot->fds[slot->nfds];
 		slot->udata[idx] = slot->udata[slot->nfds];
 
@@ -2387,7 +2389,7 @@ static int gwk_server_eph_send_slave_conn(struct gwk_client *client,
 		return ret;
 	}
 
-	printf("Accepted slave connection (fd=%d, idx=%u, addr=%s:%hu) from %s:%hu\n",
+	printf("Accepted a slave connection (fd=%d, idx=%u, addr=%s:%hu) from %s:%hu\n",
 	       slave_a->fd, slave_pair->idx, sa_addr(addr), sa_port(addr),
 	       sa_addr(&client->src_addr), sa_port(&client->src_addr));
 
@@ -2526,6 +2528,9 @@ static int gwk_server_eph_accept(struct gwk_client *client, struct pollfd *pfd)
 	return ret;
 }
 
+/*
+ * Must be called with client->lock held.
+ */
 static void gwk_server_eph_close_slave_pair(struct gwk_client *client,
 					    struct gwk_slave_pair *pair)
 {
@@ -2541,12 +2546,16 @@ static void gwk_server_eph_close_slave_pair(struct gwk_client *client,
 	if (b->fd >= 0) {
 		assert(b->pfd->fd == b->fd);
 		poll_del_slave(client->poll_slot, slot, b);
+	} else {
+		pthread_mutex_lock(&client->lock);
+		client->nr_pending_circuits--;
+		pthread_mutex_unlock(&client->lock);
 	}
 
-	pr_debug("Closing slave connection of %s:%hu (fd_a=%d, fd_b=%d, idx=%u, addr=%s:%hu, slave_idx=%u)\n",
-		 sa_addr(&client->src_addr), sa_port(&client->src_addr),
-		 a->fd, b->fd, client->idx, sa_addr(&client->src_addr),
-		 sa_port(&client->src_addr), pair->idx);
+	printf("Closing slave connection of %s:%hu (fd_a=%d, fd_b=%d, idx=%u, addr=%s:%hu, slave_idx=%u)\n",
+	       sa_addr(&client->src_addr), sa_port(&client->src_addr),
+	       a->fd, b->fd, client->idx, sa_addr(&client->src_addr),
+	       sa_port(&client->src_addr), pair->idx);
 
 	put_gwk_slave_pair(slot, pair);
 }
@@ -2765,9 +2774,7 @@ static int _gwk_server_eph_poll(struct gwk_client *client, uint32_t nr_events)
 			slave = udata->ptr;
 			assert(pfd == slave->pfd);
 			assert(pfd->fd == slave->fd);
-			pthread_mutex_lock(&client->lock);
 			ret = gwk_server_eph_forward(client, slave);
-			pthread_mutex_unlock(&client->lock);
 		}
 
 		if (ret)
@@ -2830,12 +2837,18 @@ static int gwk_server_eph_scan_timeout_slave(struct gwk_client *client)
 			continue;
 		}
 
+		/*
+		 * gwk_server_eph_close_slave_pair() will take the
+		 * client and slot->fs locks, so we need to release
+		 * them first.
+		 */
 		pthread_mutex_unlock(&slot->fs.lock);
 		pthread_mutex_unlock(&client->lock);
+
 		gwk_server_eph_close_slave_pair(client, pair);
+
 		pthread_mutex_lock(&client->lock);
 		pthread_mutex_lock(&slot->fs.lock);
-		client->nr_pending_circuits--;
 	}
 	client->largest_time_diff = largest_tdiff;
 	pthread_mutex_unlock(&slot->fs.lock);
@@ -3931,15 +3944,19 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 		goto out_term;
 	}
 
-	fd_a = create_sock_and_connect(&ctx->server_addr);
+	addr = &ctx->target_addr;
+	fd_a = create_sock_and_connect(addr);
 	if (fd_a < 0) {
-		pr_err("Connect to server: %s\n", strerror(-fd_a));
+		pr_err("Connect to target: %s:%hu: %s\n", sa_addr(addr),
+		       sa_port(addr), strerror(-fd_a));
 		goto out_put_slave;
 	}
 
-	fd_b = create_sock_and_connect(&ctx->target_addr);
+	addr = &ctx->server_addr;
+	fd_b = create_sock_and_connect(addr);
 	if (fd_b < 0) {
-		pr_err("Connect to target: %s\n", strerror(-fd_b));
+		pr_err("Connect to server: %s:%hu: %s\n", sa_addr(addr),
+		       sa_port(addr), strerror(-fd_b));
 		goto out_close_a;
 	}
 
