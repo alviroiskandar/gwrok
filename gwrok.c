@@ -3896,6 +3896,18 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 	pair->a.buf_len = 0;
 	pair->b.buf_len = 0;
 
+	ret = set_nonblock(fd_a);
+	if (ret < 0) {
+		pr_err("Failed to set A nonblock: %s\n", strerror(-ret));
+		goto out_close_b;
+	}
+
+	ret = set_nonblock(fd_b);
+	if (ret < 0) {
+		pr_err("Failed to set B nonblock: %s\n", strerror(-ret));
+		goto out_close_b;
+	}
+
 	ret = poll_add_slave(ps, &ctx->slave_slot, &pair->a, POLLIN);
 	if (ret < 0) {
 		pr_err("Failed to add slave A to poll: %s\n", strerror(-ret));
@@ -3930,6 +3942,7 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 		pr_err("Failed to write to pipe: %s\n", strerror(errno));
 
 	return 0;
+
 out_del_b:
 	poll_del_slave(ps, &ctx->slave_slot, &pair->b);
 out_del_a:
@@ -4102,6 +4115,8 @@ static int gwk_client_run_event_loop(struct gwk_client_ctx *ctx)
 {
 	struct poll_udata data;
 	int ret;
+
+	set_nonblock(ctx->tcp_fd);
 
 	data.ptr = ctx;
 	ret = poll_add(ctx->poll_slot_main, ctx->tcp_fd, POLLIN, &data);
