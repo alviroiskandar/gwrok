@@ -3839,6 +3839,24 @@ static int gwk_client_poll_circuit(struct gwk_client_ctx *ctx)
 	return _gwk_client_poll_circuit(ctx, (uint32_t)ret);
 }
 
+static void gwk_client_close_all_slaves(struct gwk_client_ctx *ctx)
+{
+	struct gwk_slave_slot *slot = &ctx->slave_slot;
+	struct gwk_slave_pair *pair;
+	uint32_t i, n;
+
+	n = slot->fs.stack->rbp;
+	for (i = 0; i < n; i++) {
+		pair = &slot->entries[i];
+		if (atomic_read(&pair->refcnt) == 0)
+			continue;
+
+		printf("Closing a slave connection %s:%hu\n",
+		       sa_addr(&pair->a.addr), sa_port(&pair->a.addr));
+		gwk_client_close_slave_pair(ctx, pair);
+	}
+}
+
 static void *gwk_client_circuit_thread(void *arg)
 {
 	struct gwk_client_ctx *ctx = arg;
@@ -3852,6 +3870,7 @@ static void *gwk_client_circuit_thread(void *arg)
 			break;
 	}
 
+	gwk_client_close_all_slaves(ctx);
 	return NULL;
 }
 
