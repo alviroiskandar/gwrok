@@ -1994,10 +1994,14 @@ static void remove_gwk_client_from_poll_slot(struct poll_slot *ps,
 static void gwk_server_close_client(struct gwk_server_ctx *ctx,
 				    struct gwk_client *client)
 {
+	if (client->tcp_fd == -2)
+		goto out;
+
 	printf("Closing a client connection (fd=%d, idx=%u, addr=%s:%hu)\n",
 	       client->tcp_fd, client->idx, sa_addr(&client->src_addr),
 	       sa_port(&client->src_addr));
 
+out:
 	remove_gwk_client_from_poll_slot(ctx->poll_slot, client);
 	stop_gwk_client(client);
 	put_gwk_client(&ctx->client_slot, client);
@@ -2533,9 +2537,6 @@ static int gwk_server_eph_accept(struct gwk_client *client, struct pollfd *pfd)
 	return ret;
 }
 
-/*
- * Must be called with client->lock held.
- */
 static void gwk_server_eph_close_slave_pair(struct gwk_client *client,
 					    struct gwk_slave_pair *pair)
 {
@@ -3981,7 +3982,7 @@ static int _gwk_client_handle_slave_conn(struct gwk_client_ctx *ctx)
 
 	addr = &pair->a.addr;
 	slave_conn_to_sockaddr(sc, addr);
-	ret = gwk_client_send_slave_conn(ctx, fd_a, addr);
+	ret = gwk_client_send_slave_conn(ctx, fd_b, addr);
 	if (ret < 0) {
 		pr_err("Failed to send slave conn: %s\n", strerror(-ret));
 		goto out_close_b;
