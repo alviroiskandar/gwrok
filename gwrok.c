@@ -209,6 +209,18 @@ struct gwk_slave {
 	struct sockaddr_storage		addr;
 };
 
+/*
+ * A gwk_slave_pair is a pair of gwk_slave structs, one for the
+ * "circuit" and one for the "target".
+ *
+ * "gwrok client" <-> "gwrok server" <-> "visitor"
+ *
+ * The "circuit" is the "visitor" <-> "gwrok server" connection.
+ * The "target" is the "gwrok server" <-> "gwrok client" connection.
+ *
+ * Each data received from the "circuit" is forwarded to the "target"
+ * and vice versa.
+ */
 struct gwk_slave_pair {
 	union {
 		struct gwk_slave	a;
@@ -229,11 +241,25 @@ struct gwk_slave_slot {
 	struct gwk_slave_pair	*entries;
 };
 
+/*
+ * Each "./gwrok client" instance is represented by a gwk_client
+ * struct in the server.
+ */
 struct gwk_client {
 	volatile bool			stop;
 	volatile bool			used;
+
+	/*
+	 * A flag to indicate whether the eph thread needs to be joined
+	 * with pthread_join() before the client is freed.
+	 */
 	volatile bool			need_join;
+
 	volatile bool			being_waited;
+
+	/*
+	 * A flag to indicate whether the handshake is done.
+	 */
 	bool				handshake_ok;
 
 	/*
@@ -270,6 +296,10 @@ struct gwk_client {
 	struct poll_slot		*poll_slot;
 	struct gwk_slave_slot		slave_slot;
 
+	/*
+	 * spkt = send packet buffer.
+	 * rpkt = receive packet buffer.
+	 */
 	union {
 		struct pkt		spkt;
 		char			__spkt[sizeof(struct pkt) * 4];
@@ -282,12 +312,20 @@ struct gwk_client {
 	size_t				rpkt_len;
 
 	/*
-	 * Protected by lock.
+	 * Protected by the lock.
 	 *
 	 * The number of slaves that don't have a target yet.
 	 */
 	uint32_t			nr_pending_circuits;
 
+	/*
+	 * Used to calculate the largest time difference between
+	 * the creation time of a slave pair.
+	 *
+	 * This greatly reduces the number of poll() calls by
+	 * specifying a timeout value that is large enough to
+	 * cover the largest time difference.
+	 */
 	int				largest_time_diff;
 
 	/*
@@ -301,6 +339,9 @@ struct gwk_client {
 	 */
 	uint32_t			c_timeout_scan;
 
+	/*
+	 * The reference count of this client.
+	 */
 	atomic_t			refcnt;
 };
 
@@ -386,6 +427,7 @@ struct gwk_client_ctx {
 	 *  - fc_track
 	 */
 	pthread_mutex_t			circuit_lock;
+
 	pthread_t			circuit_thread;
 	struct gwk_client_cfg		cfg;
 	const char			*app;
