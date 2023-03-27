@@ -1,3 +1,6 @@
+# Author
+- Alviro Iskandar Setiawan (57741034)
+
 # gwrok
 A simple TCP port forwarder for GNU/Weeb. Inspired by [ngrok](https://ngrok.com/).
 
@@ -90,7 +93,3 @@ tq
 
 # License
 GNU General Public License v2.0
-
-
-# Author
-Alviro Iskandar Setiawan &lt;alviro.iskandar@gnuweeb.org&gt;
