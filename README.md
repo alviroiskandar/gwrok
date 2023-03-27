@@ -83,9 +83,10 @@ tq
 
 
 # Screenshots
-![gwrok client](ss_001.png?raw=true "gwrok client")
-![gwrok server](ss_002.png?raw=true "gwrok server")
-
+![gwrok on Ubuntu 001](ss_001.png?raw=true "gwrok on Ubuntu 001")
+![gwrok on Ubuntu 002](ss_002.png?raw=true "gwrok on Ubuntu 002")
+![gwrok on Android 001](ss_android_001.jpg?raw=true "gwrok on Android 001")
+![gwrok on Android 002](ss_android_002.jpg?raw=true "gwrok on Android 002")
 
 # License
 GNU General Public License v2.0
