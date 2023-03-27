@@ -593,7 +593,7 @@ static int gwk_client_parse_args(struct gwk_client_ctx *ctx,
 	int c, gp;
 
 	while (1) {
-		c = getopt_long(argc, argv, "Hs:P:t:p:v", gwk_client_long_opts,
+		c = getopt_long(argc, argv, "Hs:P:t:p:m:v", gwk_client_long_opts,
 				NULL);
 		if (c == -1)
 			break;
