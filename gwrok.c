@@ -2578,10 +2578,10 @@ static void gwk_server_eph_close_slave_pair(struct gwk_client *client,
 		pthread_mutex_unlock(&client->lock);
 	}
 
-	printf("Closing slave connection of %s:%hu (fd_a=%d, fd_b=%d, idx=%u, addr=%s:%hu, slave_idx=%u)\n",
+	printf("Closing a slave connection of %s:%hu (fd_a=%d, fd_b=%d, idx=%u, addr=%s:%hu, slave_idx=%u)\n",
 	       sa_addr(&client->src_addr), sa_port(&client->src_addr),
-	       a->fd, b->fd, client->idx, sa_addr(&client->src_addr),
-	       sa_port(&client->src_addr), pair->idx);
+	       a->fd, b->fd, client->idx, sa_addr(&pair->a.addr),
+	       sa_port(&pair->a.addr), pair->idx);
 
 	put_gwk_slave_pair(slot, pair);
 }
