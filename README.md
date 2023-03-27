@@ -50,6 +50,15 @@ Options:
 
 ```
 
+# Server usage example
+Let's say you want to share your VPS public IP address (188.166.250.196) using
+the gwrok server. You can do:
+```
+./gwrok server --shared-addr 188.166.250.196 --bind-addr 0.0.0.0 -p 8000
+```
+Make sure you have opened port 8000 and all ports for the shared address in your
+firewall.
+
 
 # Client usage example
 For example, if you have a web server running on your local machine with address
@@ -60,7 +69,13 @@ use gwrok to do that:
 ```
 By default it will use my server 188.166.250.196:8000. It will not last forever
 though. You can also use your own gwrok server by specifying the server address
-and port with `--server-addr` and `--server-port` options.
+and port with `--server-addr` and `--server-port` options like:
+```
+./gwrok client --target-addr 127.0.0.1 --target-port 80 --server-addr 123.123.123.123 --server-port 8000
+```
+where 123.123.123.123 is your server address and 8000 is the port you have
+opened for gwrok server.
+
 
 tq
 
