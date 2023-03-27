@@ -3145,6 +3145,14 @@ static int _gwk_server_assign_conn_back(struct gwk_client *master,
 	int ret;
 
 	pthread_mutex_lock(&master->slave_slot.fs.lock);
+	if (!master->slave_slot.entries) {
+		pr_err("The master connection of %s:%hu is not active (slave_idx=%u)\n",
+		       sa_addr(&client->src_addr), sa_port(&client->src_addr),
+		       slave_idx);
+		ret = -EINVAL;
+		goto out;
+	}
+
 	sp = &master->slave_slot.entries[slave_idx];
 	if (atomic_read(&sp->refcnt) == 0) {
 		pr_err("The slave connection of %s:%hu is not active (slave_idx=%u)\n",
