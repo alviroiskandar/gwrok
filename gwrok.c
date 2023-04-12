@@ -1851,7 +1851,11 @@ static int create_sock_and_bind(struct sockaddr_storage *addr)
 
 	gwk_setsockopt(fd);
 
-	len = sizeof(*addr);
+	if (addr->ss_family == AF_INET6)
+		len = sizeof(struct sockaddr_in6);
+	else
+		len = sizeof(struct sockaddr_in);
+
 	ret = bind(fd, (struct sockaddr *)addr, len);
 	if (ret < 0) {
 		ret = -errno;
@@ -3671,7 +3675,11 @@ static int create_sock_and_connect(struct sockaddr_storage *addr,
 
 	gwk_setsockopt(fd);
 
-	len = sizeof(*addr);
+	if (addr->ss_family == AF_INET6)
+		len = sizeof(struct sockaddr_in6);
+	else
+		len = sizeof(struct sockaddr_in);
+
 	ret = connect(fd, (struct sockaddr *)addr, len);
 	if (ret < 0) {
 
